@@ -38,13 +38,24 @@ _MASK_ID = 4
 
 TokenizerKind = Literal["hamiltonian", "bpe"]
 
+# Fallback tokenizer artifact locations, relative to the repo root inferred from a
+# checkpoint path (checkpoints live at <repo_root>/runs/<flavor>/checkpoint-*.pt per
+# the ham-dna-tokenizer README's training pipeline). Only used when tokenizer_path
+# isn't given explicitly, so the wrapper never has to hard-code a machine-specific path.
+_DEFAULT_TOKENIZER_ARTIFACT_RELATIVE_TO_REPO_ROOT = {
+    "hamiltonian": Path("artifacts") / "ham-4091.json",
+    "bpe": Path("artifacts") / "bpe-4096" / "tokenizer.json",
+}
+
 
 class DNABERT2SmallModel(nn.Module):
     """ham-dna-tokenizer's ~8M-parameter DNABERT2-style MLM encoder for GFMBench.
 
     Instantiate once per tokenizer flavor by passing ``tokenizer_kind`` ("hamiltonian"
-    or "bpe") and the matching ``tokenizer_path`` (a Hamiltonian vocabulary JSON or a
-    BPE ``tokenizer.json``, per the ham-dna-tokenizer README's training pipeline).
+    or "bpe"). ``tokenizer_path`` (a Hamiltonian vocabulary JSON or a BPE
+    ``tokenizer.json``, per the ham-dna-tokenizer README's training pipeline) can be
+    given explicitly, or left unset and inferred from the checkpoint path passed to
+    ``load_checkpoint`` via the repo's conventional ``artifacts/`` layout.
     """
 
     def __init__(
@@ -59,17 +70,16 @@ class DNABERT2SmallModel(nn.Module):
         Args:
             device: torch device ('cpu' or 'cuda')
             tokenizer_kind: 'hamiltonian' or 'bpe', selecting the tokenizer flavor
-            tokenizer_path: path to the trained tokenizer artifact for that flavor
+            tokenizer_path: path to the trained tokenizer artifact for that flavor;
+                if omitted, it is inferred from the checkpoint path on load_checkpoint()
             max_length: maximum sequence length including CLS/SEP (<= config.max_position_embeddings)
             pretrained: unused placeholder for registry symmetry with other wrappers;
                 weights are always randomly initialized here and loaded via load_checkpoint
         """
         super().__init__()
-        if not tokenizer_path:
-            raise ValueError("tokenizer_path is required")
         self.device = device
         self.tokenizer_kind = tokenizer_kind
-        self.tokenizer_path = Path(tokenizer_path)
+        self.encode = None
         self.config = DNABERT2SmallConfig()
         if max_length > self.config.max_position_embeddings:
             raise ValueError(
@@ -78,8 +88,8 @@ class DNABERT2SmallModel(nn.Module):
             )
         self.max_length = max_length
 
-        print(f"Loading DNABERT2-small ({tokenizer_kind}) tokenizer from: {self.tokenizer_path}")
-        self.encode = load_sequence_encoder(tokenizer_kind, self.tokenizer_path)
+        if tokenizer_path:
+            self._load_tokenizer(tokenizer_path)
 
         self.model = DNABERT2SmallForMaskedLM(self.config)
         self.add_module("model", self.model)
@@ -93,6 +103,24 @@ class DNABERT2SmallModel(nn.Module):
             f"DNABERT2-small ({tokenizer_kind}) loaded. Hidden dim: {self.hidden_dim}, "
             f"max_length: {self.max_length}, params: {self.model.num_parameters():,}"
         )
+
+    def _load_tokenizer(self, tokenizer_path) -> None:
+        tokenizer_path = Path(tokenizer_path)
+        print(f"Loading DNABERT2-small ({self.tokenizer_kind}) tokenizer from: {tokenizer_path}")
+        self.tokenizer_path = tokenizer_path
+        self.encode = load_sequence_encoder(self.tokenizer_kind, tokenizer_path)
+
+    def _infer_tokenizer_path(self, checkpoint_path) -> Path:
+        """Resolve the tokenizer artifact for a checkpoint the caller trained.
+
+        Assumes the ham-dna-tokenizer repo's default layout, where a checkpoint at
+        ``<repo_root>/runs/<flavor>/checkpoint-*.pt`` has its matching tokenizer
+        artifact at ``<repo_root>/artifacts/...``.
+        """
+        # checkpoint file -> <flavor> dir -> runs dir -> repo root
+        repo_root = Path(checkpoint_path).resolve().parent.parent.parent
+        relative = _DEFAULT_TOKENIZER_ARTIFACT_RELATIVE_TO_REPO_ROOT[self.tokenizer_kind]
+        return repo_root / relative
 
     def eval(self):
         self.model.eval()
@@ -125,6 +153,11 @@ class DNABERT2SmallModel(nn.Module):
 
     def _encode_content(self, sequence: str) -> Tuple[List[int], List[int]]:
         """Tokenize DNA content only, truncated to fit CLS/SEP within max_length."""
+        if self.encode is None:
+            raise RuntimeError(
+                "no tokenizer loaded; pass tokenizer_path to the constructor or call "
+                "load_checkpoint() first"
+            )
         content_length = self.max_length - 2
         token_ids, token_bases = self.encode(sequence)
         return token_ids[:content_length], token_bases[:content_length]
@@ -249,6 +282,9 @@ class DNABERT2SmallModel(nn.Module):
         )
 
     def load_checkpoint(self, checkpoint_path: str):
+        if self.encode is None:
+            self._load_tokenizer(self._infer_tokenizer_path(checkpoint_path))
+
         print(f"Loading checkpoint from: {checkpoint_path}")
         state = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 

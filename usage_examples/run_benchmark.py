@@ -148,27 +148,24 @@ MODEL_REGISTRY = {
     },
     "DNABERT2Small_Hamiltonian": {
         # ham-dna-tokenizer's ~8M-param DNABERT2-style encoder, Hamiltonian tokenizer flavor.
-        # Use --checkpoint_path to load weights from a runs/ham/checkpoint-*.pt produced by
-        # `ham-dna-tokenizer train-opengenome2-mlm --tokenizer-kind hamiltonian ...`.
+        # Requires --checkpoint_path pointing at a runs/ham/checkpoint-*.pt produced by
+        # `ham-dna-tokenizer train-opengenome2-mlm --tokenizer-kind hamiltonian ...`; the
+        # matching tokenizer artifact is inferred from that checkpoint path's repo layout
+        # (<repo_root>/artifacts/ham-4091.json), so no machine-specific path is hard-coded here.
         "module": "usage_examples.sanity_models.dnabert2_small_model",
         "class": "DNABERT2SmallModel",
         "max_length": 128,
-        "model_kwargs": {
-            "tokenizer_kind": "hamiltonian",
-            "tokenizer_path": "/Users/rkellerman/work/hamiltonian-tokenizer/artifacts/ham-4091.json",
-        },
+        "model_kwargs": {"tokenizer_kind": "hamiltonian"},
     },
     "DNABERT2Small_BPE": {
         # Same architecture, DNABERT2-style BPE tokenizer flavor.
-        # Use --checkpoint_path to load weights from a runs/bpe/checkpoint-*.pt produced by
-        # `ham-dna-tokenizer train-opengenome2-mlm --tokenizer-kind bpe ...`.
+        # Requires --checkpoint_path pointing at a runs/bpe/checkpoint-*.pt produced by
+        # `ham-dna-tokenizer train-opengenome2-mlm --tokenizer-kind bpe ...`; the matching
+        # tokenizer artifact is inferred the same way (<repo_root>/artifacts/bpe-4096/tokenizer.json).
         "module": "usage_examples.sanity_models.dnabert2_small_model",
         "class": "DNABERT2SmallModel",
         "max_length": 128,
-        "model_kwargs": {
-            "tokenizer_kind": "bpe",
-            "tokenizer_path": "/Users/rkellerman/work/hamiltonian-tokenizer/artifacts/bpe-4096/tokenizer.json",
-        },
+        "model_kwargs": {"tokenizer_kind": "bpe"},
     },
 }
 
