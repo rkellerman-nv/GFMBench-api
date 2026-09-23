@@ -176,6 +176,11 @@ class DNABERT2SmallModel(nn.Module):
         attention_mask = input_ids.ne(_PAD_ID)
         return {"input_ids": input_ids, "attention_mask": attention_mask}
 
+    def _sequence_to_representative(self, sequences):
+        encoded = self.tokenize(sequences)
+        outputs = self.model(**encoded)
+        return outputs.last_hidden_state[:, self.cls_index, :]
+
     def infer_sequence_to_sequence(self, sequences, conditional_input=None):
         encoded = self.tokenize(sequences)
 
