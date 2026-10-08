@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DNABERT2-small (~8M param) adapter for GFMBench, covering both the Hamiltonian
-and BPE tokenizer flavors trained in the ham-dna-tokenizer repo.
+"""DNABERT2-small (~8M param) adapter for GFMBench, covering the Hamiltonian, BPE and
+single-nucleotide tokenizer flavors trained in the ham-dna-tokenizer repo.
 
 Requires the ``ham-dna-tokenizer`` package (and its ``model``/``dnabert2-style``
 extras) to be importable; it supplies the model architecture (``DNABERT2SmallForMaskedLM``)
@@ -36,7 +36,7 @@ _SEP_ID = 2
 _PAD_ID = 3
 _MASK_ID = 4
 
-TokenizerKind = Literal["hamiltonian", "bpe"]
+TokenizerKind = Literal["hamiltonian", "bpe", "nucleotide"]
 
 # Fallback tokenizer artifact locations, relative to the repo root inferred from a
 # checkpoint path (checkpoints live at <repo_root>/runs/<flavor>/checkpoint-*.pt per
@@ -51,8 +51,9 @@ _DEFAULT_TOKENIZER_ARTIFACT_RELATIVE_TO_REPO_ROOT = {
 class DNABERT2SmallModel(nn.Module):
     """ham-dna-tokenizer's ~8M-parameter DNABERT2-style MLM encoder for GFMBench.
 
-    Instantiate once per tokenizer flavor by passing ``tokenizer_kind`` ("hamiltonian"
-    or "bpe"). ``tokenizer_path`` (a Hamiltonian vocabulary JSON or a BPE
+    Instantiate once per tokenizer flavor by passing ``tokenizer_kind`` ("hamiltonian",
+    "bpe" or "nucleotide"; the latter has no tokenizer file and needs ``max_length=512``
+    to match its training context). ``tokenizer_path`` (a Hamiltonian vocabulary JSON or a BPE
     ``tokenizer.json``, per the ham-dna-tokenizer README's training pipeline) can be
     given explicitly, or left unset and inferred from the checkpoint path passed to
     ``load_checkpoint`` via the repo's conventional ``artifacts/`` layout.
@@ -69,10 +70,11 @@ class DNABERT2SmallModel(nn.Module):
         """
         Args:
             device: torch device ('cpu' or 'cuda')
-            tokenizer_kind: 'hamiltonian' or 'bpe', selecting the tokenizer flavor
+            tokenizer_kind: 'hamiltonian', 'bpe' or 'nucleotide', selecting the tokenizer flavor
             tokenizer_path: path to the trained tokenizer artifact for that flavor;
                 if omitted, it is inferred from the checkpoint path on load_checkpoint()
-            max_length: maximum sequence length including CLS/SEP (<= config.max_position_embeddings)
+            max_length: maximum sequence length including CLS/SEP; sizes the position table,
+                so it must equal the checkpoint's context length (128, or 512 for nucleotide)
             pretrained: unused placeholder for registry symmetry with other wrappers;
                 weights are always randomly initialized here and loaded via load_checkpoint
         """
@@ -80,15 +82,14 @@ class DNABERT2SmallModel(nn.Module):
         self.device = device
         self.tokenizer_kind = tokenizer_kind
         self.encode = None
-        self.config = DNABERT2SmallConfig()
-        if max_length > self.config.max_position_embeddings:
-            raise ValueError(
-                f"max_length ({max_length}) exceeds max_position_embeddings "
-                f"({self.config.max_position_embeddings})"
-            )
+        self.config = DNABERT2SmallConfig(max_position_embeddings=max_length)
         self.max_length = max_length
 
-        if tokenizer_path:
+        if tokenizer_kind == "nucleotide":
+            if tokenizer_path:
+                raise ValueError("the nucleotide flavor has no tokenizer file")
+            self.encode = load_sequence_encoder(tokenizer_kind, None)
+        elif tokenizer_path:
             self._load_tokenizer(tokenizer_path)
 
         self.model = DNABERT2SmallForMaskedLM(self.config)
@@ -159,6 +160,8 @@ class DNABERT2SmallModel(nn.Module):
                 "load_checkpoint() first"
             )
         content_length = self.max_length - 2
+        if self.tokenizer_kind == "nucleotide":
+            sequence = sequence.upper()
         token_ids, token_bases = self.encode(sequence)
         return token_ids[:content_length], token_bases[:content_length]
 

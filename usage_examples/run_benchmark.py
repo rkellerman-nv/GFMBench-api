@@ -167,6 +167,15 @@ MODEL_REGISTRY = {
         "max_length": 128,
         "model_kwargs": {"tokenizer_kind": "bpe"},
     },
+    "DNABERT2Small_Nucleotide": {
+        # Same architecture, single-nucleotide tokens (one base per token, no tokenizer file).
+        # Requires --checkpoint_path pointing at a runs/nucleotide/checkpoint-*.pt produced by
+        # `ham-dna-tokenizer train-opengenome2-mlm --tokenizer-kind nucleotide --context-length 512 ...`.
+        "module": "usage_examples.sanity_models.dnabert2_small_model",
+        "class": "DNABERT2SmallModel",
+        "max_length": 512,
+        "model_kwargs": {"tokenizer_kind": "nucleotide"},
+    },
 }
 
 
