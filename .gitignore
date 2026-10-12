@@ -10,3 +10,8 @@ __pycache__/
 logs/
 .cursor/rules/shell-environment.mdc
 *.egg-info/
+
+# Local benchmark reports
+/*.csv
+/*.csv.shard*
+/*.csv.shard*.log

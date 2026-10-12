@@ -273,7 +273,44 @@ def parse_args(argv=None):
         metavar="TASK",
         help="Task names to skip (e.g. --exclude_tasks vepeval_clinvar).",
     )
+    parser.add_argument(
+        "--include_tasks",
+        nargs="*",
+        default=None,
+        metavar="TASK",
+        help="Run only these task names (default: all registered tasks).",
+    )
+    parser.add_argument(
+        "--shard",
+        type=str,
+        default=None,
+        metavar="I/N",
+        help="Run only shard I (0-based) of N: after include/exclude filtering, tasks are "
+             "dealt round-robin to shards. Use one process (and GPU) per shard, each with "
+             "its own --csv_path; see usage_examples/run_benchmark_sharded.sh.",
+    )
     return parser.parse_args(argv)
+
+
+def select_task_names(include_tasks, exclude_tasks, shard):
+    """Registry task names to run, after include/exclude filtering and sharding."""
+    names = list(TASK_REGISTRY)
+    if include_tasks is not None:
+        unknown = [n for n in include_tasks if n not in TASK_REGISTRY]
+        if unknown:
+            raise ValueError(f"Unknown task(s) in --include_tasks: {unknown}")
+        names = [n for n in names if n in include_tasks]
+    names = [n for n in names if n not in exclude_tasks]
+    if shard is not None:
+        try:
+            index, count = (int(x) for x in shard.split("/"))
+        except ValueError:
+            raise ValueError(f"--shard must look like I/N, got {shard!r}") from None
+        if count < 1 or not 0 <= index < count:
+            raise ValueError(f"--shard {shard}: need 0 <= I < N")
+        # Round-robin by registry order; task cost is unknown here, so shards may be unbalanced.
+        names = names[index::count]
+    return names
 
 
 def set_seed(seed: int):
@@ -295,6 +332,7 @@ def set_seed(seed: int):
         except AttributeError:
             pass
 
+    # Only affects subprocesses: the hash seed of this interpreter is fixed at startup.
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 
@@ -383,12 +421,10 @@ def main(argv=None):
     else:
         logging.info("Using full datasets (max_num_samples=None)")
 
-    # Instantiate all tasks from the registry
-    tasks = [
-        cls(root_data_dir_path=root_data_dir_path, task_config=task_config)
-        for name, cls in TASK_REGISTRY.items()
-        if name not in args.exclude_tasks
-    ]
+    # Tasks are instantiated lazily (one at a time, in the loop below) so a shard only
+    # builds the datasets of its own tasks. A task whose data is missing therefore fails
+    # when its turn comes, not up front.
+    task_names = select_task_names(args.include_tasks, args.exclude_tasks, args.shard)
 
     # Training parameters for fine-tuning tasks
     training_params = {
@@ -401,7 +437,8 @@ def main(argv=None):
         "num_workers": 0,
     }
 
-    logging.info(f"********* Number of tasks: {len(tasks)} *********")
+    logging.info(f"********* Number of tasks: {len(task_names)} *********")
+    logging.info(f"Tasks: {task_names}")
     logging.info(f"Model: {args.model}")
     logging.info(
         f"Training mode: {'Linear Probing' if training_params['only_proj_layer'] else 'Full Fine-tuning'}"
@@ -411,8 +448,14 @@ def main(argv=None):
     benchmark_start = time.perf_counter()
 
     # Run each task
-    for task in tasks:
+    for registry_name in task_names:
         task_start = time.perf_counter()
+        # Seed before dataset construction so a task's data does not depend on which
+        # tasks ran before it (needed for sharded runs to match a serial run).
+        set_seed(seed)
+        task = TASK_REGISTRY[registry_name](
+            root_data_dir_path=root_data_dir_path, task_config=task_config
+        )
         task_name = task.get_task_name()
         logging.info(f"{'='*50}")
         logging.info(f"Running task: {task_name}")
