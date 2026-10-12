@@ -210,6 +210,13 @@ def parse_args(argv=None):
         help="Checkpoint to load (set to None to use default HuggingFace weights)"
     )
     parser.add_argument(
+        "--tokenizer_path",
+        type=str,
+        default=None,
+        help="Tokenizer artifact for DNABERT2Small_* models. By default it is located from the "
+             "checkpoint's run.json and verified against the checksum the checkpoint recorded."
+    )
+    parser.add_argument(
         "--linear_prob",
         action="store_true",
         help="If set, train only the projection layer for supervised tasks (linear probing). "
@@ -336,7 +343,11 @@ def main(argv=None):
         raise ValueError("Evo2 does not support full fine-tuning. Use --linear_prob for Evo2 benchmarks.")
     ModelClass = get_model_class(args.model)
     max_length = MODEL_REGISTRY[args.model]["max_length"]
-    model_init_kwargs = MODEL_REGISTRY[args.model].get("model_kwargs", {})
+    model_init_kwargs = dict(MODEL_REGISTRY[args.model].get("model_kwargs", {}))
+    if args.tokenizer_path:
+        if MODEL_REGISTRY[args.model]["class"] != "DNABERT2SmallModel":
+            raise ValueError("--tokenizer_path is only supported for DNABERT2Small_* models")
+        model_init_kwargs["tokenizer_path"] = args.tokenizer_path
     
     logging.info(f"Model: {args.model}, Max sequence length: {max_length}")
     

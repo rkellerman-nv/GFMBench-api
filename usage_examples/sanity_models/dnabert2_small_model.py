@@ -21,6 +21,8 @@ extras) to be importable; it supplies the model architecture (``DNABERT2SmallFor
 and both tokenizer loaders behind a shared no-special-token encoding contract.
 """
 
+import hashlib
+import json
 from pathlib import Path
 from typing import List, Literal, Optional, Tuple
 
@@ -38,10 +40,11 @@ _MASK_ID = 4
 
 TokenizerKind = Literal["hamiltonian", "bpe", "nucleotide"]
 
-# Fallback tokenizer artifact locations, relative to the repo root inferred from a
-# checkpoint path (checkpoints live at <repo_root>/runs/<flavor>/checkpoint-*.pt per
-# the ham-dna-tokenizer README's training pipeline). Only used when tokenizer_path
-# isn't given explicitly, so the wrapper never has to hard-code a machine-specific path.
+# Last-resort tokenizer artifact locations, relative to the repo root inferred from a
+# checkpoint path (checkpoints live at <repo_root>/runs/<run>/checkpoint-*.pt per
+# the ham-dna-tokenizer README's training pipeline). Used only when neither tokenizer_path
+# nor the run's own record (run.json / the checkpoint's tokenizer checksum) identifies the
+# tokenizer; these defaults are NOT correct for every run of a given flavor.
 _DEFAULT_TOKENIZER_ARTIFACT_RELATIVE_TO_REPO_ROOT = {
     "hamiltonian": Path("artifacts") / "ham-4091.json",
     "bpe": Path("artifacts") / "bpe-4096" / "tokenizer.json",
@@ -111,17 +114,60 @@ class DNABERT2SmallModel(nn.Module):
         self.tokenizer_path = tokenizer_path
         self.encode = load_sequence_encoder(self.tokenizer_kind, tokenizer_path)
 
-    def _infer_tokenizer_path(self, checkpoint_path) -> Path:
-        """Resolve the tokenizer artifact for a checkpoint the caller trained.
+    def _infer_tokenizer_path(self, checkpoint_path, expected_sha256: Optional[str] = None) -> Path:
+        """Resolve the tokenizer artifact the checkpoint was trained with.
 
-        Assumes the ham-dna-tokenizer repo's default layout, where a checkpoint at
-        ``<repo_root>/runs/<flavor>/checkpoint-*.pt`` has its matching tokenizer
-        artifact at ``<repo_root>/artifacts/...``.
+        Order of evidence: the run's ``run.json`` next to the checkpoint (recorded path, then
+        the same ``artifacts/...`` tail under this repo root, then the file name), each
+        candidate accepted only if its sha256 equals ``expected_sha256`` (taken from the
+        checkpoint, else ``run.json``). With no record at all, falls back to the flavor's
+        default artifact and warns, because a default can silently be the wrong vocabulary.
         """
-        # checkpoint file -> <flavor> dir -> runs dir -> repo root
-        repo_root = Path(checkpoint_path).resolve().parent.parent.parent
-        relative = _DEFAULT_TOKENIZER_ARTIFACT_RELATIVE_TO_REPO_ROOT[self.tokenizer_kind]
-        return repo_root / relative
+        checkpoint_path = Path(checkpoint_path).resolve()
+        # checkpoint file -> run dir -> runs dir -> repo root
+        repo_root = checkpoint_path.parent.parent.parent
+        run = self._read_run_json(checkpoint_path)
+        if run is not None and run.get("tokenizer_kind") not in (None, self.tokenizer_kind):
+            raise ValueError(
+                f"{checkpoint_path.parent / 'run.json'} records tokenizer_kind="
+                f"{run['tokenizer_kind']!r} but this model was built with {self.tokenizer_kind!r}"
+            )
+        expected = expected_sha256 or (run or {}).get("tokenizer_sha256")
+        recorded = (run or {}).get("tokenizer_path")
+        if recorded:
+            recorded = Path(recorded)
+            candidates = [recorded]
+            if "artifacts" in recorded.parts:
+                last = max(i for i, part in enumerate(recorded.parts) if part == "artifacts")
+                candidates.append(repo_root / "artifacts" / Path(*recorded.parts[last + 1 :]))
+            candidates.append(repo_root / "artifacts" / recorded.name)
+            for candidate in candidates:
+                if candidate.is_file() and (not expected or self._sha256(candidate) == expected):
+                    return candidate
+            raise FileNotFoundError(
+                f"no tokenizer matching sha256 {expected} found (recorded path {recorded}, "
+                f"searched under {repo_root / 'artifacts'}); pass --tokenizer_path explicitly"
+            )
+        default = repo_root / _DEFAULT_TOKENIZER_ARTIFACT_RELATIVE_TO_REPO_ROOT[self.tokenizer_kind]
+        print(
+            f"WARNING: no run.json next to {checkpoint_path}; falling back to the default "
+            f"{self.tokenizer_kind} tokenizer {default}. This is wrong for any run trained "
+            "with a different vocabulary; pass --tokenizer_path to be sure."
+        )
+        return default
+
+    @staticmethod
+    def _read_run_json(checkpoint_path: Path) -> Optional[dict]:
+        run_path = Path(checkpoint_path).parent / "run.json"
+        return json.loads(run_path.read_text()) if run_path.is_file() else None
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+        return digest.hexdigest()
 
     def eval(self):
         self.model.eval()
@@ -290,11 +336,26 @@ class DNABERT2SmallModel(nn.Module):
         )
 
     def load_checkpoint(self, checkpoint_path: str):
-        if self.encode is None:
-            self._load_tokenizer(self._infer_tokenizer_path(checkpoint_path))
-
         print(f"Loading checkpoint from: {checkpoint_path}")
         state = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+
+        if self.tokenizer_kind != "nucleotide":
+            expected = state.get("tokenizer_sha256") if isinstance(state, dict) else None
+            if self.encode is None:
+                self._load_tokenizer(self._infer_tokenizer_path(checkpoint_path, expected))
+            expected = expected or (self._read_run_json(Path(checkpoint_path)) or {}).get(
+                "tokenizer_sha256"
+            )
+            if expected:
+                actual = self._sha256(Path(self.tokenizer_path))
+                if actual != expected:
+                    raise ValueError(
+                        f"tokenizer {self.tokenizer_path} (sha256 {actual}) is not the one this "
+                        f"checkpoint was trained with (sha256 {expected}); pass --tokenizer_path"
+                    )
+                print(f"Tokenizer checksum matches the checkpoint's record ({expected[:12]}...)")
+            else:
+                print("WARNING: no tokenizer checksum recorded for this checkpoint; not verified")
 
         if "model" in state:
             self.model.load_state_dict(state["model"], strict=False)
