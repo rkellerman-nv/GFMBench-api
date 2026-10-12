@@ -23,8 +23,9 @@ and both tokenizer loaders behind a shared no-special-token encoding contract.
 
 import hashlib
 import json
+from collections import OrderedDict
 from pathlib import Path
-from typing import List, Literal, Optional, Tuple
+from typing import List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -37,6 +38,11 @@ _CLS_ID = 1
 _SEP_ID = 2
 _PAD_ID = 3
 _MASK_ID = 4
+
+# Bounds on memoized encodings (LRU eviction); the character budget keeps RAM bounded even
+# when sequences are very long.
+_ENCODE_CACHE_MAX_ENTRIES = 500_000
+_ENCODE_CACHE_MAX_CHARS = 200_000_000
 
 TokenizerKind = Literal["hamiltonian", "bpe", "nucleotide"]
 
@@ -85,6 +91,9 @@ class DNABERT2SmallModel(nn.Module):
         self.device = device
         self.tokenizer_kind = tokenizer_kind
         self.encode = None
+        self._encode_cache: "OrderedDict[str, tuple]" = OrderedDict()
+        self._encode_cache_chars = 0
+        self._nucleotide_token_ids: Optional[dict] = None
         self.config = DNABERT2SmallConfig(max_position_embeddings=max_length)
         self.max_length = max_length
 
@@ -113,6 +122,9 @@ class DNABERT2SmallModel(nn.Module):
         print(f"Loading DNABERT2-small ({self.tokenizer_kind}) tokenizer from: {tokenizer_path}")
         self.tokenizer_path = tokenizer_path
         self.encode = load_sequence_encoder(self.tokenizer_kind, tokenizer_path)
+        self._encode_cache.clear()
+        self._encode_cache_chars = 0
+        self._nucleotide_token_ids = None
 
     def _infer_tokenizer_path(self, checkpoint_path, expected_sha256: Optional[str] = None) -> Path:
         """Resolve the tokenizer artifact the checkpoint was trained with.
@@ -198,18 +210,35 @@ class DNABERT2SmallModel(nn.Module):
     def load_state_dict(self, state_dict, strict: bool = True):
         return self.model.load_state_dict(state_dict, strict=strict)
 
-    def _encode_content(self, sequence: str) -> Tuple[List[int], List[int]]:
+    def _encode_content(self, sequence: str) -> Tuple[Sequence[int], Sequence[int]]:
         """Tokenize DNA content only, truncated to fit CLS/SEP within max_length."""
         if self.encode is None:
             raise RuntimeError(
                 "no tokenizer loaded; pass tokenizer_path to the constructor or call "
                 "load_checkpoint() first"
             )
+        cached = self._encode_cache.get(sequence)
+        if cached is not None:
+            self._encode_cache.move_to_end(sequence)
+            return cached
         content_length = self.max_length - 2
+        key = sequence
         if self.tokenizer_kind == "nucleotide":
             sequence = sequence.upper()
         token_ids, token_bases = self.encode(sequence)
-        return token_ids[:content_length], token_bases[:content_length]
+        # Tuples: cached values are shared between callers and must not be mutated.
+        result = (tuple(token_ids[:content_length]), tuple(token_bases[:content_length]))
+        # Tokenizing is the benchmark's CPU bottleneck and each sequence is otherwise encoded
+        # several times per batch (embeddings, SNV position mapping, masked LLR, epochs).
+        self._encode_cache[key] = result
+        self._encode_cache_chars += len(key)
+        while self._encode_cache and (
+            len(self._encode_cache) > _ENCODE_CACHE_MAX_ENTRIES
+            or self._encode_cache_chars > _ENCODE_CACHE_MAX_CHARS
+        ):
+            old_key, _ = self._encode_cache.popitem(last=False)
+            self._encode_cache_chars -= len(old_key)
+        return result
 
     def tokenize(self, sequences: List[str]):
         batch_ids = []
@@ -245,6 +274,16 @@ class DNABERT2SmallModel(nn.Module):
             hidden_states_seq.detach().cpu().numpy(),
             sequence_representative.detach().cpu().numpy(),
         )
+
+    def _get_nucleotide_token_ids(self) -> dict:
+        if self._nucleotide_token_ids is None:
+            ids = {}
+            for nuc in ["A", "T", "C", "G"]:
+                tokens, _ = self.encode(nuc)
+                if len(tokens) == 1:
+                    ids[nuc] = tokens[0]
+            self._nucleotide_token_ids = ids
+        return self._nucleotide_token_ids
 
     def sequence_pos_to_prob_pos(self, sequences, pos):
         batch_size = len(sequences)
@@ -308,12 +347,7 @@ class DNABERT2SmallModel(nn.Module):
             outputs = self.model(input_ids=input_ids, attention_mask=encoded["attention_mask"])
             probs = torch.softmax(outputs.logits, dim=-1)
 
-        nucleotide_token_ids = {}
-        for nuc in ["A", "T", "C", "G"]:
-            tokens, _ = self.encode(nuc)
-            if len(tokens) == 1:
-                nucleotide_token_ids[nuc] = tokens[0]
-
+        nucleotide_token_ids = self._get_nucleotide_token_ids()
         if len(nucleotide_token_ids) < 4:
             return None, None
 
