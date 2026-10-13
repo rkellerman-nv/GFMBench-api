@@ -108,7 +108,6 @@ class DNABERT2SmallModel(nn.Module):
         self.add_module("model", self.model)
         self.model.to(device)
 
-        self.cls_index = 0
         self.hidden_dim = self.config.hidden_size
         self.mlm_head_loaded = True
 
@@ -254,10 +253,21 @@ class DNABERT2SmallModel(nn.Module):
         attention_mask = input_ids.ne(_PAD_ID)
         return {"input_ids": input_ids, "attention_mask": attention_mask}
 
+    @staticmethod
+    def _mean_pool_content(hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        """Mean of the DNA-content token states, excluding CLS, SEP and padding.
+
+        The model is MLM-trained without a CLS objective, so position 0 is not a meaningful
+        sequence summary.
+        """
+        special = (input_ids == _CLS_ID) | (input_ids == _SEP_ID) | (input_ids == _PAD_ID)
+        weights = (~special).unsqueeze(-1).to(hidden_states.dtype)
+        return (hidden_states * weights).sum(1) / weights.sum(1).clamp_min(1.0)
+
     def _sequence_to_representative(self, sequences):
         encoded = self.tokenize(sequences)
         outputs = self.model(**encoded)
-        return outputs.last_hidden_state[:, self.cls_index, :]
+        return self._mean_pool_content(outputs.last_hidden_state, encoded["input_ids"])
 
     def infer_sequence_to_sequence(self, sequences, conditional_input=None):
         encoded = self.tokenize(sequences)
@@ -266,7 +276,7 @@ class DNABERT2SmallModel(nn.Module):
             outputs = self.model(**encoded)
         hidden_states = outputs.last_hidden_state
 
-        sequence_representative = hidden_states[:, self.cls_index, :]
+        sequence_representative = self._mean_pool_content(hidden_states, encoded["input_ids"])
         hidden_states_seq = hidden_states[:, 1:-1, :]
 
         return (
