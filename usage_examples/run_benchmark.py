@@ -393,19 +393,27 @@ def main(argv=None):
         if has_finetuning_data:
             hidden_dim = model.get_hidden_dim()
             task_type = task_attrs["task_type"]
-            if task_type != "classification":
+            if task_type not in ("classification", "regression"):
                 raise NotImplementedError(
-                    "The usage-example fine-tuner currently supports classification only."
+                    f"The usage-example fine-tuner does not support task_type={task_type!r}."
                 )
-            classification_mode = task_attrs["classification_mode"]
-            is_variant_effect = task_attrs["is_variant_effect_prediction"]
             num_labels = task_attrs["num_labels"]
-            num_classes = task_attrs["num_classes"]
-            num_outputs = (
-                num_classes
-                if num_labels == 1
-                else num_labels if num_classes == 2 else num_labels * num_classes
-            )
+            if task_type == "regression":
+                classification_mode = "single_label"
+                is_variant_effect = False
+                num_classes = 1
+                num_outputs = num_labels
+                num_bins = task_attrs["num_bins"]
+            else:
+                classification_mode = task_attrs["classification_mode"]
+                is_variant_effect = task_attrs["is_variant_effect_prediction"]
+                num_classes = task_attrs["num_classes"]
+                num_outputs = (
+                    num_classes
+                    if num_labels == 1
+                    else num_labels if num_classes == 2 else num_labels * num_classes
+                )
+                num_bins = 1
             
             train_dataset = task.get_finetune_dataset()
 
@@ -435,6 +443,8 @@ def main(argv=None):
                 num_classes=num_classes,
                 is_variant_effect_prediction=is_variant_effect,
                 cache_size=args.cache_size,
+                task_type=task_type,
+                num_bins=num_bins,
                 device=device
             )
             
