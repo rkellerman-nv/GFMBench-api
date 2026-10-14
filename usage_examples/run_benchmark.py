@@ -49,6 +49,7 @@ from gfmbench_api.tasks.concrete.bend_vep_expression_task import BendVEPExpressi
 from gfmbench_api.tasks.concrete.gue_promoter_all_task import GuePromoterAllTask
 from gfmbench_api.tasks.concrete.gue_splice_site_task import GueSpliceSiteTask
 from gfmbench_api.tasks.concrete.gue_tf_all_task import GueTranscriptionFactorTask
+from gfmbench_api.tasks.concrete.lrb_cage_task import LRBCagePredictionTask
 from gfmbench_api.tasks.concrete.lrb_causal_eqtl_task import LRBCausalEqtlTask
 from gfmbench_api.tasks.concrete.lrb_enhancer_task import LRBEnhancerTask
 from gfmbench_api.tasks.concrete.lrb_histone_marks_task import LRBHistoneMarksTask
@@ -77,6 +78,7 @@ TASK_REGISTRY: dict[str, type] = {
     "lrb_variant_effect_pathogenic_omim": LrbVariantEffectPathogenicOmimTask,
     "lrb_regulatory_element_enhancer":   LRBEnhancerTask,
     "lrb_chromatin_features_histone_marks": LRBHistoneMarksTask,
+    "lrb_cage_prediction":               LRBCagePredictionTask,
     "bend_variant_effects_disease":       BendVEPDisease,
     "bend_variant_effects_expression":    BendVEPExpression,
     "gue_promoter_all":                   GuePromoterAllTask,
