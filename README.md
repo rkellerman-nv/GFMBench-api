@@ -154,6 +154,23 @@ Classification probabilities use shape `[batch, classes]` for single-label tasks
 `[batch, labels]` for binary multi-label tasks, and `[batch, labels, classes]`
 for multi-class multi-label tasks.
 
+- **Regression tasks** have no dedicated model method. They use `infer_sequence_to_sequence` (and
+  `sequence_pos_to_prob_pos` for binned tasks). A raw model needs nothing extra: it simply gets
+  `None` metrics. A model that owns a trained regression head (such as the `GFMWithProjection`
+  wrapper in `usage_examples/trainers`) returns the head's outputs in the same slots:
+  `sequence_representative` as `[batch, num_labels]` for sequence-level tasks, and
+  `sequence_embeddings` as per-token `[batch, tokens, num_labels]` for binned tasks. The task
+  mean-pools the per-token outputs into `num_bins` bins by fractional token position, using
+  `sequence_pos_to_prob_pos` on each sequence's last nucleotide to find its valid-token count.
+  A model signals this with a truthy `has_regression_head` attribute; without it the task does not
+  query the model and reports `None` metrics. A declared head whose output width differs from
+  `num_labels` raises an error.
+  - *Limitations of this contract:* the head must be applied per token before pooling (exactly
+    equivalent to pooling first only for a linear head); a nonlinear head applied after pooling is
+    not supported; `overlap` (bp-weighted) pooling is not supported; the valid-token count is
+    approximate for tokenizers whose last nucleotide does not map to the last output position;
+    empty bins are `0` rather than the head's bias; and the example fine-tuner trains regression
+    heads on a frozen backbone only.
 - Any not-implemented methods can simply return `None` and metrics depending on them will be skipped.
 - See `gfmbench_api/tasks/base/base_gfm_model.py` for detailed docstrings.
 - Step-by-step tutorial (mock model → NTv3 8M, BEND + GUE): [`usage_examples/add_new_model_tutorial.ipynb`](usage_examples/add_new_model_tutorial.ipynb).
@@ -410,8 +427,11 @@ Choose the appropriate base class based on your task:
   single-label classification; multiple labels are independent classification targets.
 
 - **Supervised Regression**: Inherit from `BaseGFMSupervisedRegressionTask`
-  - Implement `is_spatial_binned()` to return `True` for binned outputs or
-    `False` for sequence-level outputs
+  - Implement `get_bin_size_bp()` to return the bin size in bp for binned outputs or
+    `None` for sequence-level outputs. The `num_bins` task attribute is derived as
+    `max_sequence_length // bin_size_bp` (1 for sequence-level tasks).
+    This replaces `is_spatial_binned()` and the `output_spatiality` attribute;
+    consumers can use `num_bins > 1` to identify binned outputs.
   
 - **Zero-Shot SNV Variant Effect**: Inherit from `BaseGFMZeroShotSNVTask`
   - For zero-shot evaluation of single-nucleotide variants (SNVs) with equal-length reference and variant sequences
@@ -441,7 +461,7 @@ Additional methods for supervised classification tasks:
 Additional methods for supervised regression tasks:
 
 5. **`_get_num_labels() -> int`**: Return the number of continuous labels per sequence or bin
-6. **`is_spatial_binned() -> bool`**: Return whether outputs include a spatial bin dimension
+6. **`get_bin_size_bp() -> Optional[int]`**: Return the bin size in bp for binned outputs (`[batch, num_bins, num_labels]`), or `None` for sequence-level outputs (`[batch, num_labels]`). `max_sequence_length` must be an exact multiple of the bin size and yield at least 2 bins.
 
 Additional methods for zero-shot tasks:
 

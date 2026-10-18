@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 
 from gfmbench_api.tasks.base.base_gfm_model import BaseGFMModel
+from gfmbench_api.utils.binning import to_float_tensor
 from gfmbench_api.utils.caching_utils import SequenceInferenceCache
 
 
@@ -37,6 +38,8 @@ class GFMWithProjection(BaseGFMModel):
         num_labels: int = 1,
         num_classes: int = 2,
         cache_size: Optional[float] = None,
+        task_type: str = "classification",
+        num_bins: int = 1,
     ) -> None:
         """
         Initialize the wrapped model.
@@ -47,6 +50,10 @@ class GFMWithProjection(BaseGFMModel):
             num_labels: number of independent classification targets
             num_classes: number of classes per target
             cache_size: cache RAM limit in GB; None for unlimited, 0 disables caching
+            task_type: "classification" or "regression". In regression mode the
+                projection layer is a regression head and infer_sequence_to_sequence
+                returns its outputs (see infer_sequence_to_sequence).
+            num_bins: number of output bins of a regression task (1 = sequence-level)
         """
         self.base_model: BaseGFMModel = base_model
         self.projection_layer: Optional[nn.Module] = projection_layer
@@ -54,7 +61,14 @@ class GFMWithProjection(BaseGFMModel):
         self.num_classes = num_classes
         self.device: str = base_model.device
         self.cache_size = cache_size
+        self.task_type = task_type
+        self.num_bins = num_bins
         self._ref_cache = SequenceInferenceCache(max_size_gb=cache_size)
+
+    @property
+    def has_regression_head(self) -> bool:
+        """True when this wrapper holds a trained regression head (read by regression tasks)."""
+        return self.task_type == "regression" and self.projection_layer is not None
 
     def clear_ref_cache(self) -> None:
         """Clear cached reference-sequence inference (call after each benchmark task)."""
@@ -100,19 +114,43 @@ class GFMWithProjection(BaseGFMModel):
     
     def infer_sequence_to_sequence(self, sequences: List[str], conditional_input=None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
         """
-        Delegate to base model for sequence-to-sequence inference.
-        
+        Sequence-to-sequence inference of the base model.
+
+        In regression mode (``task_type == "regression"`` with a projection layer) the
+        regression head is applied to the base outputs, so regression tasks can read
+        predictions through the public API without a regression-specific method:
+            - sequence_embeddings: [batch_size, seq_len, num_labels] per-token head
+              outputs (only when num_bins > 1; the task pools them into bins)
+            - sequence_representative: [batch_size, num_labels] head output on the
+              sequence embedding
+        sequence_probs is passed through unchanged. Otherwise the base model's outputs
+        are returned as they are.
+
         Args:
             sequences: list of DNA strings
             conditional_input: Optional metadata inputs
-            
+
         Returns:
             tuple: (sequence_probs, sequence_embeddings, sequence_representative)
-                - sequence_probs: np.ndarray [batch_size, seq_len] OR None
-                - sequence_embeddings: np.ndarray [batch_size, seq_len, hidden_dim] OR None
-                - sequence_representative: np.ndarray [batch_size, hidden_dim] OR None
         """
-        return self.base_model.infer_sequence_to_sequence(sequences, conditional_input)
+        probs, embeddings, representative = self.base_model.infer_sequence_to_sequence(
+            sequences, conditional_input
+        )
+        if not self.has_regression_head:
+            return probs, embeddings, representative
+
+        def apply_head(values: Optional[np.ndarray]) -> Optional[np.ndarray]:
+            if values is None:
+                return None
+            with torch.no_grad():
+                x = to_float_tensor(values, self.device)
+                return self.projection_layer(x).float().cpu().numpy()
+
+        return (
+            probs,
+            apply_head(embeddings) if self.num_bins > 1 else None,
+            apply_head(representative),
+        )
     
     def sequence_pos_to_prob_pos(self, sequences: List[str], pos: int) -> np.ndarray:
         """
