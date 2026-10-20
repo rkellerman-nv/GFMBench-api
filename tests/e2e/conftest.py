@@ -107,6 +107,20 @@ class MockGFMModel:
     ) -> np.ndarray:
         return np.full(len(sequences), pos, dtype=np.int32)
 
+    def get_affected_token_spans(
+        self,
+        variant_sequences: List[str],
+        reference_sequences: List[str],
+        context_tokens: int = 0,
+    ) -> np.ndarray:
+        from gfmbench_api.utils.token_diff import divergent_token_span
+
+        spans = np.zeros((len(variant_sequences), 4), dtype=np.int32)
+        for i, (var, ref) in enumerate(zip(variant_sequences, reference_sequences)):
+            ref_start, ref_end, var_start, var_end = divergent_token_span(list(ref), list(var), context_tokens)
+            spans[i] = (var_start, var_end, ref_start, ref_end)
+        return spans
+
     def infer_masked_sequence_to_token_probs(
         self,
         sequences: List[str],

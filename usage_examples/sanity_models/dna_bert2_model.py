@@ -22,6 +22,8 @@ import torch
 import torch.nn as nn
 from transformers import AutoConfig, AutoModelForMaskedLM, AutoTokenizer
 
+from gfmbench_api.utils.token_diff import clipped_divergent_spans
+
 
 class DNABERT2Model(nn.Module):
     """zhihan1996/DNABERT-2-117M as AutoModelForMaskedLM (encoder + MLM head) for benchmark infer_* APIs."""
@@ -206,6 +208,29 @@ class DNABERT2Model(nn.Module):
                 output_positions[i] = -1
 
         return output_positions
+
+    def get_affected_token_spans(self, variant_sequences, reference_sequences, context_tokens=0):
+        """Token spans (var_start, var_end, ref_start, ref_end) affected by each variant.
+
+        Indices are into the embeddings of infer_sequence_to_sequence (CLS/SEP removed).
+        Diff full tokenizations before clipping to the retained content tokens. Pairs
+        with no affected tokens retained on either side are marked invalid, even if
+        their widened context would overlap the retained sequence.
+        """
+        max_content_tokens = self.max_length - 2
+        spans = np.full((len(variant_sequences), 4), -1, dtype=np.int32)
+        for i, (var_seq, ref_seq) in enumerate(zip(variant_sequences, reference_sequences)):
+            try:
+                var_ids, ref_ids = (
+                    self.tokenizer(
+                        seq, add_special_tokens=False, truncation=False
+                    )["input_ids"]
+                    for seq in (var_seq, ref_seq)
+                )
+                spans[i] = clipped_divergent_spans(ref_ids, var_ids, context_tokens, max_content_tokens)
+            except Exception:
+                pass
+        return spans
 
     def infer_sequence_to_labels_probs(self, sequences, conditional_input=None):
         return None

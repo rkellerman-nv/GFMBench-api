@@ -27,7 +27,9 @@ class BaseGFMZeroShotGeneralIndelTask(BaseGFMZeroShotTask):
     No fine-tuning is performed - evaluates model's pre-trained capabilities.
     
     This class handles datasets with any variant types (insertions, deletions, etc.)
-    and uses only the common zero-shot metrics (no SNV-specific metrics).
+    and uses the common zero-shot metrics plus the affected-region metrics (no SNV-position
+    metrics, since an indel has no single variant position). The affected region is found by
+    diffing the variant and reference tokenizations, so it needs no position.
     
     Subclasses must implement:
         - _create_test_dataset(): Return test dataset
@@ -36,8 +38,8 @@ class BaseGFMZeroShotGeneralIndelTask(BaseGFMZeroShotTask):
     """
 
     def _get_additional_metrics(self) -> List[tuple]:
-        """Return empty list (no additional metrics for general indel tasks)."""
-        return []
+        """Return the affected-region metrics (the only additional metrics for general indel tasks)."""
+        return self._get_affected_region_metrics()
 
     def _update_additional_metrics(
         self,
@@ -48,8 +50,10 @@ class BaseGFMZeroShotGeneralIndelTask(BaseGFMZeroShotTask):
         labels_np: np.ndarray,
         common_outputs: Dict[str, Optional[np.ndarray]]
     ) -> None:
-        """No-op for general indel tasks (no additional metrics to update)."""
-        pass
+        """Update affected-region metrics for a batch."""
+        self._add_affected_region_outputs(model, variant_sequences, reference_sequences, common_outputs)
+        for metric, arg_keys in additional_metrics:
+            metric.calc(*[common_outputs[key] for key in arg_keys])
 
     def _is_snv_only(self) -> bool:
         """Return False since this handles general indel variants, not just SNV."""

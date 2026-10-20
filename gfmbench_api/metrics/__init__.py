@@ -32,6 +32,14 @@ from .sequence_embeddings_cosine_sim_auprc import SequenceEmbeddingsCosineSimAUP
 from .sequence_embeddings_l2_auprc import SequenceEmbeddingsL2AUPRC
 from .sequence_embeddings_l2_auroc import SequenceEmbeddingsL2AUROC
 from .snv_variant_effect_prediction_llr_auroc import SNVVariantEffectPredictionLLRAUROC
+from .affected_region_variant_effect import (
+    AffectedRegionCosineSimAUPRC,
+    AffectedRegionCosineSimAUROC,
+    AffectedRegionL2AUPRC,
+    AffectedRegionL2AUROC,
+    AffectedRegionLengthAUROC,
+    AffectedRegionMeanLength,
+)
 
 __all__ = [
     'BaseMetric',
@@ -51,6 +59,12 @@ __all__ = [
     'SequenceEmbeddingsCosineSimAUPRC',
     'SequenceEmbeddingsL2AUPRC',
     'SequenceEmbeddingsL2AUROC',
-    'SNVVariantEffectPredictionLLRAUROC'
+    'SNVVariantEffectPredictionLLRAUROC',
+    'AffectedRegionCosineSimAUROC',
+    'AffectedRegionCosineSimAUPRC',
+    'AffectedRegionL2AUROC',
+    'AffectedRegionL2AUPRC',
+    'AffectedRegionLengthAUROC',
+    'AffectedRegionMeanLength',
 ]
 

@@ -23,6 +23,12 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from gfmbench_api.metrics import (
+    AffectedRegionCosineSimAUPRC,
+    AffectedRegionCosineSimAUROC,
+    AffectedRegionL2AUPRC,
+    AffectedRegionL2AUROC,
+    AffectedRegionLengthAUROC,
+    AffectedRegionMeanLength,
     SequenceEmbeddingsCosineSimAUPRC,
     SequenceEmbeddingsCosineSimAUROC,
     SequenceEmbeddingsL2AUPRC,
@@ -52,6 +58,38 @@ class BaseGFMZeroShotTask(BaseGFMTask):
         - use_reference_cache(): Return whether to cache reference infer_sequence_to_sequence calls
     """
     
+    # Context widths (unchanged tokens on each side of the affected region) evaluated by the
+    # affected-region metrics
+    AFFECTED_REGION_CONTEXT_TOKENS = (0, 2)
+
+    def _get_affected_region_metrics(self) -> List[tuple]:
+        """Affected-region metrics (mutation tokens + changed downstream tokens), as (metric, arg_keys)."""
+        metrics = []
+        for k in self.AFFECTED_REGION_CONTEXT_TOKENS:
+            keys = ('variant_embeddings', 'reference_embeddings', f'affected_spans_k{k}', 'labels')
+            for metric_cls in (AffectedRegionCosineSimAUROC, AffectedRegionCosineSimAUPRC,
+                               AffectedRegionL2AUROC, AffectedRegionL2AUPRC):
+                metrics.append((metric_cls(context_tokens=k), keys))
+        # Region-size diagnostics (always on k=0 spans): label-leakage baseline and mean size
+        length_keys = ('variant_embeddings', 'reference_embeddings', 'affected_spans_k0', 'labels')
+        metrics.append((AffectedRegionLengthAUROC(), length_keys))
+        metrics.append((AffectedRegionMeanLength(), length_keys))
+        return metrics
+
+    def _add_affected_region_outputs(
+        self,
+        model: Any,
+        variant_sequences: List[str],
+        reference_sequences: List[str],
+        outputs: Dict[str, Optional[np.ndarray]],
+    ) -> None:
+        """Ask the model for the affected token spans of each context width; None if unsupported."""
+        # k=0 is always requested: the region-size diagnostics are defined on it
+        for k in sorted({0, *self.AFFECTED_REGION_CONTEXT_TOKENS}):
+            outputs[f'affected_spans_k{k}'], = self._safe_model_call(
+                model, 'get_affected_token_spans', variant_sequences, reference_sequences, k, num_outputs=1
+            )
+
     def __init__(self, root_data_dir_path: str,
                  task_config: Optional[Dict[str, Any]] = None) -> None:
         """

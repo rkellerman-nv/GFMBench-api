@@ -39,6 +39,8 @@ class BaseGFMZeroShotSNVTask(BaseGFMZeroShotTask):
     Additional metrics (beyond common ones):
         - SNV position cosine similarity (BEND-style)
         - Masked token prediction LLR
+        - Affected-region (mutation tokens + changed downstream tokens) cosine/L2,
+          for each width in AFFECTED_REGION_CONTEXT_TOKENS
     
     Subclasses must implement:
         - _get_variant_position_in_sequence(): Return position of SNV in sequence
@@ -63,7 +65,7 @@ class BaseGFMZeroShotSNVTask(BaseGFMZeroShotTask):
              ('variant_token_probs', 'reference_token_probs', 'labels')),
             (SNVVariantEffectPredictionMaskedLLRAUPRC(), 
              ('variant_token_probs', 'reference_token_probs', 'labels')),
-        ]
+        ] + self._get_affected_region_metrics()
 
     def _update_additional_metrics(
         self,
@@ -106,6 +108,8 @@ class BaseGFMZeroShotSNVTask(BaseGFMZeroShotTask):
         outputs['variant_token_probs'] = variant_token_probs_np
         outputs['reference_token_probs'] = reference_token_probs_np
         
+        self._add_affected_region_outputs(model, variant_sequences, reference_sequences, outputs)
+
         # Update all SNV metrics using their specified argument keys
         for metric, arg_keys in additional_metrics:
             args = [outputs[key] for key in arg_keys]

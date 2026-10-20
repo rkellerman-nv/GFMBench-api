@@ -31,6 +31,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from gfmbench_api.utils.token_diff import clipped_divergent_spans
 from ham_dna_tokenizer.dnabert2_model import DNABERT2SmallConfig, DNABERT2SmallForMaskedLM
 from ham_dna_tokenizer.mlm_training import load_sequence_encoder
 
@@ -209,8 +210,8 @@ class DNABERT2SmallModel(nn.Module):
     def load_state_dict(self, state_dict, strict: bool = True):
         return self.model.load_state_dict(state_dict, strict=strict)
 
-    def _encode_content(self, sequence: str) -> Tuple[Sequence[int], Sequence[int]]:
-        """Tokenize DNA content only, truncated to fit CLS/SEP within max_length."""
+    def _encode_full(self, sequence: str) -> Tuple[Sequence[int], Sequence[int]]:
+        """Tokenize DNA content only, without truncation: (token_ids, bases_per_token)."""
         if self.encode is None:
             raise RuntimeError(
                 "no tokenizer loaded; pass tokenizer_path to the constructor or call "
@@ -220,13 +221,12 @@ class DNABERT2SmallModel(nn.Module):
         if cached is not None:
             self._encode_cache.move_to_end(sequence)
             return cached
-        content_length = self.max_length - 2
         key = sequence
         if self.tokenizer_kind == "nucleotide":
             sequence = sequence.upper()
         token_ids, token_bases = self.encode(sequence)
         # Tuples: cached values are shared between callers and must not be mutated.
-        result = (tuple(token_ids[:content_length]), tuple(token_bases[:content_length]))
+        result = (tuple(token_ids), tuple(token_bases))
         # Tokenizing is the benchmark's CPU bottleneck and each sequence is otherwise encoded
         # several times per batch (embeddings, SNV position mapping, masked LLR, epochs).
         self._encode_cache[key] = result
@@ -238,6 +238,12 @@ class DNABERT2SmallModel(nn.Module):
             old_key, _ = self._encode_cache.popitem(last=False)
             self._encode_cache_chars -= len(old_key)
         return result
+
+    def _encode_content(self, sequence: str) -> Tuple[Sequence[int], Sequence[int]]:
+        """Tokenize DNA content only, truncated to fit CLS/SEP within max_length."""
+        content_length = self.max_length - 2
+        token_ids, token_bases = self._encode_full(sequence)
+        return token_ids[:content_length], token_bases[:content_length]
 
     def tokenize(self, sequences: List[str]):
         batch_ids = []
@@ -311,6 +317,23 @@ class DNABERT2SmallModel(nn.Module):
             output_positions[i] = token_idx
 
         return output_positions
+
+    def get_affected_token_spans(self, variant_sequences, reference_sequences, context_tokens=0):
+        """Token spans (var_start, var_end, ref_start, ref_end) affected by each variant.
+
+        Works for all tokenizer flavors: the variant and reference tokenizations are diffed
+        before truncation (so BPE/Hamiltonian re-segmentation does not defeat suffix
+        matching) and the spans are clipped to the content tokens the model embeds, i.e.
+        indices into infer_sequence_to_sequence's hidden states (CLS/SEP removed). Pairs
+        whose affected tokens are all truncated away, or that tokenize identically, are -1.
+        """
+        content_length = self.max_length - 2
+        spans = np.full((len(variant_sequences), 4), -1, dtype=np.int32)
+        for i, (var_seq, ref_seq) in enumerate(zip(variant_sequences, reference_sequences)):
+            var_ids, _ = self._encode_full(var_seq)
+            ref_ids, _ = self._encode_full(ref_seq)
+            spans[i] = clipped_divergent_spans(ref_ids, var_ids, context_tokens, content_length)
+        return spans
 
     def infer_sequence_to_labels_probs(self, sequences, conditional_input=None):
         return None

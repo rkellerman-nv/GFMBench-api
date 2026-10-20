@@ -161,6 +161,34 @@ class BaseGFMModel(ABC):
         """
         pass
     
+    def get_affected_token_spans(
+        self,
+        variant_sequences: List[str],
+        reference_sequences: List[str],
+        context_tokens: int = 0,
+    ) -> np.ndarray:
+        """
+        Optional. Token spans of each variant/reference pair that the variant affected.
+
+        Used by the affected-region variant effect metrics. Tokenize each pair (no special
+        tokens) and pass the token IDs to `gfmbench_api.utils.token_diff.divergent_token_span`,
+        which strips the common token prefix/suffix and widens by `context_tokens`.
+
+        Args:
+            variant_sequences: List[str] - batch of variant DNA sequences
+            reference_sequences: List[str] - batch of matching reference DNA sequences
+            context_tokens: int - unchanged tokens to include on each side of the affected region
+
+        Returns:
+            np.ndarray of shape [batch_size, 4] with rows (var_start, var_end, ref_start, ref_end).
+            Half-open ranges indexing the sequence dimension of the embeddings returned by
+            infer_sequence_to_sequence (i.e. after special tokens are removed). Use -1 for
+            a pair whose span cannot be determined.
+
+        Not abstract: models that do not implement it get None for these metrics.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def infer_masked_sequence_to_token_probs(
         self, 
