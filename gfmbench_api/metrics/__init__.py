@@ -40,6 +40,20 @@ from .affected_region_variant_effect import (
     AffectedRegionLengthAUROC,
     AffectedRegionMeanLength,
 )
+from .affected_region_extensions import (
+    AffectedContextExtentMetric,
+    AffectedContextProfileMetric,
+    ContextLikelihoodMeanTokens,
+    ContextLikelihoodMetric,
+    ForcedSegmentationFraction,
+    ForcedSegmentationRegionMetric,
+    SegmentationPhaseMetric,
+    TokenizerStatisticAUROC,
+)
+from .affected_region_windows import (
+    AffectedRegionSizeStratifiedAUROC,
+    AffectedRegionWindowMetric,
+)
 
 __all__ = [
     'BaseMetric',
@@ -66,5 +80,15 @@ __all__ = [
     'AffectedRegionL2AUPRC',
     'AffectedRegionLengthAUROC',
     'AffectedRegionMeanLength',
+    'AffectedRegionSizeStratifiedAUROC',
+    'AffectedRegionWindowMetric',
+    'AffectedContextExtentMetric',
+    'AffectedContextProfileMetric',
+    'ContextLikelihoodMeanTokens',
+    'ContextLikelihoodMetric',
+    'ForcedSegmentationFraction',
+    'ForcedSegmentationRegionMetric',
+    'SegmentationPhaseMetric',
+    'TokenizerStatisticAUROC',
 ]
 

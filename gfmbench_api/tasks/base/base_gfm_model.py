@@ -189,6 +189,135 @@ class BaseGFMModel(ABC):
         """
         raise NotImplementedError
 
+    def get_affected_suffix_starts(
+        self,
+        variant_sequences: List[str],
+        reference_sequences: List[str],
+    ) -> np.ndarray:
+        """
+        Optional. Token index where the unchanged common suffix of each pair begins, per side.
+
+        Used by the affected-region metrics that compare aligned tokens around the region. The
+        spans from `get_affected_token_spans` are at least one token wide, which can swallow the
+        first unchanged token of the shorter side of an insertion or deletion, so their ends do
+        not tell which variant token matches which reference token. Pass the token IDs to
+        `gfmbench_api.utils.token_diff.clipped_common_suffix_starts`.
+
+        Args:
+            variant_sequences: List[str] - batch of variant DNA sequences
+            reference_sequences: List[str] - batch of matching reference DNA sequences
+
+        Returns:
+            np.ndarray of shape [batch_size, 2] with rows (var_suffix_start, ref_suffix_start),
+            indices into the embeddings returned by infer_sequence_to_sequence, clipped to the
+            number of embedded tokens. The variant token at index v matches the reference token
+            at v + (ref_suffix_start - var_suffix_start) from there on. Use -1 for a pair that is
+            undetermined or tokenizes identically.
+
+        Not abstract: models that do not implement it get None for these metrics.
+        """
+        raise NotImplementedError
+
+    def get_token_base_offsets(self, sequences: List[str]) -> np.ndarray:
+        """
+        Optional. Where each token starts, in bases, for the tokens the model embeds.
+
+        Used by the affected-region metrics that define their window in bases rather than
+        tokens (so tokenizers with different token lengths can be compared over the same
+        stretch of DNA). Build the array with
+        `gfmbench_api.utils.token_diff.padded_token_base_offsets` from the number of bases
+        in each content token, after truncation to the model's length limit.
+
+        Args:
+            sequences: List[str] - batch of DNA sequences
+
+        Returns:
+            np.ndarray of shape [batch_size, max_tokens + 1], int, padded with -1. Row i is
+            [0, b0, b0 + b1, ...]; entry j is the base index where token j of the embeddings
+            returned by infer_sequence_to_sequence starts (CLS/SEP removed), and the entry after
+            the last token is the number of bases those tokens cover.
+
+        Not abstract: models that do not implement it get None for these metrics.
+        """
+        raise NotImplementedError
+
+    def get_token_ids(self, sequences: List[str]) -> np.ndarray:
+        """
+        Optional. The token IDs the model embeds for each sequence (no CLS/SEP, after truncation).
+
+        Used by the tokenizer-statistics metrics. Build the array with
+        `gfmbench_api.utils.token_diff.padded_token_ids`.
+
+        Returns:
+            np.ndarray of shape [batch_size, max_tokens], int, padded with -1; column j is the
+            token behind column j of the embeddings returned by infer_sequence_to_sequence.
+
+        Not abstract: models that do not implement it get None for these metrics.
+        """
+        raise NotImplementedError
+
+    def infer_forced_segmentation_embeddings(
+        self,
+        variant_sequences: List[str],
+        reference_sequences: List[str],
+    ) -> np.ndarray:
+        """
+        Optional. Embeddings of each variant tokenized with its REFERENCE's token boundaries.
+
+        Only the tokens that overlap the substituted bases are re-tokenized (the substituted
+        bases, cut out of the reference's boundaries, are tokenized on their own); every other
+        token is the reference's own token. This removes the re-segmentation a substitution
+        causes elsewhere, so it separates a change of the embedding from a change of the
+        segmentation. Defined for equal-length variants; for others return any embeddings
+        (the natural tokenization is fine) and mark them invalid in `get_forced_segmentation_spans`.
+
+        Returns:
+            np.ndarray [batch_size, num_tokens, hidden_dim] as infer_sequence_to_sequence's
+            embeddings (CLS/SEP removed).
+
+        Not abstract: models that do not implement it get None for these metrics.
+        """
+        raise NotImplementedError
+
+    def get_forced_segmentation_spans(
+        self,
+        variant_sequences: List[str],
+        reference_sequences: List[str],
+        context_tokens: int = 0,
+    ) -> np.ndarray:
+        """
+        Optional. Token spans of the substituted tokens for `infer_forced_segmentation_embeddings`.
+
+        Returns:
+            np.ndarray [batch_size, 4] of (var_start, var_end, ref_start, ref_end): half-open
+            ranges of the re-tokenized substituted bases in the forced variant and of the
+            reference tokens they replace, each widened by `context_tokens` unchanged tokens and
+            clipped to the embedded tokens. -1 for variants that are not equal-length
+            substitutions, are identical, or whose substituted tokens are truncated away.
+
+        Not abstract: models that do not implement it get None for these metrics.
+        """
+        raise NotImplementedError
+
+    def infer_masked_token_logprobs(self, sequences: List[str], token_positions: np.ndarray) -> np.ndarray:
+        """
+        Optional. Log-probability of the true token at given positions, each masked on its own.
+
+        Used by the context-likelihood metrics. For each requested position the model sees the
+        sequence with only that token masked and returns log p(true token | rest).
+
+        Args:
+            sequences: List[str] - batch of DNA sequences
+            token_positions: np.ndarray [batch_size, P] of token indices into the embeddings
+                returned by infer_sequence_to_sequence; -1 marks an unused slot
+
+        Returns:
+            np.ndarray [batch_size, P] float; NaN for unused slots.
+
+        Not abstract: models that do not implement it get None for these metrics.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def infer_masked_sequence_to_token_probs(
         self, 

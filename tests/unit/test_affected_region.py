@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 
 from gfmbench_api.metrics import AffectedRegionL2AUROC, AffectedRegionLengthAUROC, AffectedRegionMeanLength
-from gfmbench_api.utils.token_diff import divergent_token_span
+from gfmbench_api.utils.token_diff import clipped_common_suffix_starts, divergent_token_span
 
 
 def test_snv_same_length_single_token():
@@ -132,3 +132,19 @@ def test_length_diagnostics():
     mean.calc(emb, emb, spans, gt)
     assert mean.name == "affected_region_mean_tokens"
     assert mean.get_final_results() == pytest.approx((1 + 2.5 + 3) / 3)
+
+
+def test_common_suffix_starts_are_exact_not_minimum_width():
+    # reference a b c d e f, variant deletes c: the shorter side's span is d (min width) but its
+    # suffix starts at d too, while the reference suffix starts one token later, at d.
+    assert divergent_token_span([1, 2, 3, 4, 5, 6], [1, 2, 4, 5, 6]) == (2, 3, 2, 3)
+    assert clipped_common_suffix_starts([1, 2, 3, 4, 5, 6], [1, 2, 4, 5, 6], 100) == (2, 3)
+    # substitution that re-segments 2 tokens into 3
+    assert clipped_common_suffix_starts([1, 2, 3, 4, 5, 6], [1, 2, 9, 8, 7, 5, 6], 100) == (5, 4)
+    # clipped to the retained tokens
+    assert clipped_common_suffix_starts([1, 2, 3, 4, 5, 6], [1, 2, 9, 8, 7, 5, 6], 4) == (4, 4)
+
+
+def test_common_suffix_starts_identical_or_empty():
+    assert clipped_common_suffix_starts([1, 2], [1, 2], 10) == (-1, -1)
+    assert clipped_common_suffix_starts([], [1], 10) == (-1, -1)

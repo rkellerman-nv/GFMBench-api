@@ -31,7 +31,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from gfmbench_api.utils.token_diff import clipped_divergent_spans
+from gfmbench_api.utils.token_diff import (
+    changed_base_interval,
+    clipped_common_suffix_starts,
+    clipped_divergent_spans,
+    padded_token_base_offsets,
+    padded_token_ids,
+    tokens_covering_bases,
+)
 from ham_dna_tokenizer.dnabert2_model import DNABERT2SmallConfig, DNABERT2SmallForMaskedLM
 from ham_dna_tokenizer.mlm_training import load_sequence_encoder
 
@@ -44,6 +51,10 @@ _MASK_ID = 4
 # when sequences are very long.
 _ENCODE_CACHE_MAX_ENTRIES = 500_000
 _ENCODE_CACHE_MAX_CHARS = 200_000_000
+
+# Masked-token log-probabilities are computed in chunks of about this many token positions, which
+# bounds the [chunk, length, vocabulary] logits tensor.
+_MASKED_LOGPROB_TOKEN_BUDGET = 16_384
 
 TokenizerKind = Literal["hamiltonian", "bpe", "nucleotide"]
 
@@ -246,11 +257,11 @@ class DNABERT2SmallModel(nn.Module):
         return token_ids[:content_length], token_bases[:content_length]
 
     def tokenize(self, sequences: List[str]):
-        batch_ids = []
-        for sequence in sequences:
-            content_ids, _ = self._encode_content(sequence)
-            ids = [_CLS_ID, *content_ids, _SEP_ID]
-            batch_ids.append(ids)
+        return self._batch_from_content_ids([self._encode_content(sequence)[0] for sequence in sequences])
+
+    def _batch_from_content_ids(self, content_ids_per_sequence):
+        """Model input from DNA-content token IDs: CLS/SEP added, right-padded."""
+        batch_ids = [[_CLS_ID, *content_ids, _SEP_ID] for content_ids in content_ids_per_sequence]
         width = max(len(ids) for ids in batch_ids)
         input_ids = torch.full((len(batch_ids), width), _PAD_ID, dtype=torch.long)
         for row, ids in enumerate(batch_ids):
@@ -334,6 +345,110 @@ class DNABERT2SmallModel(nn.Module):
             ref_ids, _ = self._encode_full(ref_seq)
             spans[i] = clipped_divergent_spans(ref_ids, var_ids, context_tokens, content_length)
         return spans
+
+    def get_affected_suffix_starts(self, variant_sequences, reference_sequences):
+        """Token index where the unchanged common suffix starts on each side (see BaseGFMModel)."""
+        content_length = self.max_length - 2
+        starts = np.full((len(variant_sequences), 2), -1, dtype=np.int32)
+        for i, (var_seq, ref_seq) in enumerate(zip(variant_sequences, reference_sequences)):
+            var_ids, _ = self._encode_full(var_seq)
+            ref_ids, _ = self._encode_full(ref_seq)
+            starts[i] = clipped_common_suffix_starts(ref_ids, var_ids, content_length)
+        return starts
+
+    def get_token_base_offsets(self, sequences):
+        """Base index where each embedded content token starts (see BaseGFMModel).
+
+        Uses the same truncated tokenization as infer_sequence_to_sequence, so entry j indexes
+        the same token as column j of its hidden states.
+        """
+        return padded_token_base_offsets([self._encode_content(seq)[1] for seq in sequences])
+
+    def get_token_ids(self, sequences):
+        """Token IDs of the embedded content tokens, padded with -1 (see BaseGFMModel)."""
+        return padded_token_ids([self._encode_content(seq)[0] for seq in sequences])
+
+    def _forced_segmentation(self, variant_sequence, reference_sequence):
+        """
+        The variant tokenized with the reference's boundaries outside the substituted token(s).
+
+        The substituted bases are cut out at the boundaries of the reference tokens they touch and
+        tokenized on their own. Returns (forced_ids, first, n_new, last, n_ref) where the variant's
+        tokens [first, first + n_new) replace the reference's tokens [first, last), or None for a
+        pair that is not an equal-length substitution.
+        """
+        interval = changed_base_interval(reference_sequence, variant_sequence)
+        if interval is None:
+            return None
+        ref_ids, ref_bases = self._encode_full(reference_sequence)
+        bounds = np.concatenate([[0], np.cumsum(ref_bases, dtype=np.int64)])
+        first, last = tokens_covering_bases(bounds, *interval)
+        if first < 0:
+            return None
+        low, high = int(bounds[first]), int(bounds[last])
+        new_ids, new_bases = self._encode_full(variant_sequence[low:high])
+        if len(new_ids) == 0 or sum(new_bases) != high - low:
+            return None
+        return (*ref_ids[:first], *new_ids, *ref_ids[last:]), first, len(new_ids), last, len(ref_ids)
+
+    def infer_forced_segmentation_embeddings(self, variant_sequences, reference_sequences):
+        """Embeddings of the variants tokenized with the references' boundaries (see BaseGFMModel)."""
+        content_length = self.max_length - 2
+        content = []
+        for var_seq, ref_seq in zip(variant_sequences, reference_sequences):
+            forced = self._forced_segmentation(var_seq, ref_seq)
+            ids = forced[0] if forced is not None else self._encode_full(var_seq)[0]
+            content.append(ids[:content_length])
+        encoded = self._batch_from_content_ids(content)
+        with torch.no_grad():
+            hidden_states = self.model(**encoded).last_hidden_state
+        return hidden_states[:, 1:-1, :].detach().cpu().numpy()
+
+    def get_forced_segmentation_spans(self, variant_sequences, reference_sequences, context_tokens=0):
+        """Spans of the re-tokenized substituted bases in the forced variant (see BaseGFMModel)."""
+        content_length = self.max_length - 2
+        spans = np.full((len(variant_sequences), 4), -1, dtype=np.int32)
+        for i, (var_seq, ref_seq) in enumerate(zip(variant_sequences, reference_sequences)):
+            forced = self._forced_segmentation(var_seq, ref_seq)
+            if forced is None:
+                continue
+            ids, first, n_new, last, n_ref = forced
+            if first >= content_length:
+                continue
+            spans[i] = (
+                max(0, first - context_tokens),
+                min(len(ids), content_length, first + n_new + context_tokens),
+                max(0, first - context_tokens),
+                min(n_ref, content_length, last + context_tokens),
+            )
+        return spans
+
+    def infer_masked_token_logprobs(self, sequences, token_positions):
+        """log p(true token | sequence with only that token masked) per position (see BaseGFMModel)."""
+        positions = np.asarray(token_positions)
+        result = np.full(positions.shape, np.nan, dtype=np.float32)
+        encoded = self.tokenize(sequences)
+        input_ids, attention_mask = encoded["input_ids"], encoded["attention_mask"]
+        # CLS and SEP are the only special tokens in a row besides padding
+        num_content = (attention_mask.sum(dim=1) - 2).cpu().numpy()
+        rows, slots = np.nonzero((positions >= 0) & (positions < num_content[:, None]))
+        if rows.size == 0:
+            return result
+        columns = positions[rows, slots] + 1  # past CLS
+        chunk = max(1, _MASKED_LOGPROB_TOKEN_BUDGET // input_ids.shape[1])
+        with torch.no_grad():
+            for start in range(0, rows.size, chunk):
+                sel = slice(start, start + chunk)
+                row_index = torch.as_tensor(rows[sel], device=input_ids.device)
+                column_index = torch.as_tensor(columns[sel], device=input_ids.device)
+                batch = input_ids[row_index].clone()
+                arange = torch.arange(batch.shape[0], device=batch.device)
+                true_ids = batch[arange, column_index].clone()
+                batch[arange, column_index] = _MASK_ID
+                logits = self.model(input_ids=batch, attention_mask=attention_mask[row_index]).logits
+                log_probs = torch.log_softmax(logits[arange, column_index].float(), dim=-1)
+                result[rows[sel], slots[sel]] = log_probs[arange, true_ids].cpu().numpy()
+        return result
 
     def infer_sequence_to_labels_probs(self, sequences, conditional_input=None):
         return None
