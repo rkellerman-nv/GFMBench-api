@@ -399,15 +399,13 @@ def main(argv=None):
                     f"The usage-example fine-tuner does not support task_type={task_type!r}."
                 )
             num_labels = task_attrs["num_labels"]
+            classification_mode = task_attrs["classification_mode"]
+            is_variant_effect = task_attrs["is_variant_effect_prediction"]
             if task_type == "regression":
-                classification_mode = "single_label"
-                is_variant_effect = False
                 num_classes = 1
                 num_outputs = num_labels
                 num_bins = task_attrs["num_bins"]
             else:
-                classification_mode = task_attrs["classification_mode"]
-                is_variant_effect = task_attrs["is_variant_effect_prediction"]
                 num_classes = task_attrs["num_classes"]
                 num_outputs = (
                     num_classes

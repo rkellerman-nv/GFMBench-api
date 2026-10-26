@@ -64,35 +64,22 @@ def test_invalid_binned_sequence_length_is_rejected(sequence_length, message):
 
 
 class ModelWithHead:
-    """Model returning regression outputs through the public sequence-to-sequence slots.
+    """Model returning final regression predictions via infer_sequence_to_regression_outputs.
 
-    One token per nucleotide; ``token_outputs`` / ``sequence_outputs`` map a sequence to
-    its per-token / per-sequence regression outputs.
+    ``outputs`` maps a sequence to its prediction: [num_labels] for sequence-level
+    tasks, [num_bins, num_labels] for binned tasks.
     """
 
-    def __init__(self, token_outputs=None, sequence_outputs=None, has_regression_head=True):
-        self.has_regression_head = has_regression_head
-        self.token_outputs = token_outputs
-        self.sequence_outputs = sequence_outputs
+    def __init__(self, outputs=None):
+        self.outputs = outputs
 
-    def infer_sequence_to_sequence(self, sequences, conditional_input=None):
-        tokens = (
-            None
-            if self.token_outputs is None
-            else np.stack([self.token_outputs[s] for s in sequences])
-        )
-        reps = (
-            None
-            if self.sequence_outputs is None
-            else np.stack([self.sequence_outputs[s] for s in sequences])
-        )
-        return None, tokens, reps
-
-    def sequence_pos_to_prob_pos(self, sequences, pos):
-        return np.full(len(sequences), pos)
+    def infer_sequence_to_regression_outputs(self, sequences, conditional_input=None):
+        if self.outputs is None:
+            return None
+        return np.stack([self.outputs[s] for s in sequences])
 
 
-def test_sequence_level_evaluation_reads_sequence_representative():
+def test_sequence_level_evaluation_scores_regression_outputs():
     task = RegressionTask(None)
     task.batch_size = 2
     targets = {
@@ -100,86 +87,73 @@ def test_sequence_level_evaluation_reads_sequence_representative():
     }
     dataset = [(seq, label, np.array([])) for seq, label in targets.items()]
 
-    scores = task._eval_dataset(ModelWithHead(sequence_outputs=targets), dataset)
+    scores = task._eval_dataset(ModelWithHead(targets), dataset)
 
     assert scores["regression_pearsonr_macro"] == pytest.approx(1.0)
     assert scores["regression_r2_macro"] == pytest.approx(1.0)
 
 
-def test_binned_evaluation_pools_token_outputs_into_bins():
+def test_binned_evaluation_scores_regression_outputs():
     task = RegressionTask(128)  # 512 bp -> 4 bins
     task.batch_size = 2
     targets = {
         base * 512: np.arange(8, dtype=np.float32).reshape(4, 2) + i
         for i, base in enumerate("ACGT")
     }
-    # Per-token outputs are constant within each 128-token bin, so mean pooling
-    # recovers the bin values exactly.
-    token_outputs = {seq: np.repeat(label, 128, axis=0) for seq, label in targets.items()}
     dataset = [(seq, label, np.array([])) for seq, label in targets.items()]
 
-    scores = task._eval_dataset(ModelWithHead(token_outputs=token_outputs), dataset)
+    scores = task._eval_dataset(ModelWithHead(targets), dataset)
 
     assert scores["regression_pearsonr_macro"] == pytest.approx(1.0)
     assert scores["regression_r2_macro"] == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize("bin_size_bp", [None, 128])
-def test_model_without_regression_head_yields_none_metrics(bin_size_bp):
+def test_model_without_regression_outputs_yields_none_metrics(bin_size_bp):
     task = RegressionTask(bin_size_bp)
     shape = (2,) if bin_size_bp is None else (4, 2)
     dataset = [("A" * 512, np.zeros(shape), np.array([]))]
     expected = {"regression_pearsonr_macro": None, "regression_r2_macro": None}
 
-    # A raw model's embeddings must not be scored, even when their width equals
-    # num_labels, and it must not be queried or have positions mapped.
-    class RawModel:
-        def infer_sequence_to_sequence(self, *args, **kwargs):
-            raise AssertionError("raw models must not be queried")
-
-        def sequence_pos_to_prob_pos(self, *args, **kwargs):
-            raise AssertionError("raw models must not be mapped")
-
-    assert task._eval_dataset(RawModel(), dataset) == expected
+    # Same convention as classification: a model that does not implement the method,
+    # or returns None in the slots the task reads, is skipped silently.
     assert task._eval_dataset(object(), dataset) == expected
-    same_width = ModelWithHead(
-        token_outputs={"A" * 512: np.zeros((512, 2))},
-        sequence_outputs={"A" * 512: np.zeros(2)},
-        has_regression_head=False,
-    )
-    assert task._eval_dataset(same_width, dataset) == expected
+    assert task._eval_dataset(ModelWithHead(), dataset) == expected
 
 
 @pytest.mark.parametrize("bin_size_bp", [None, 128])
-def test_declared_head_with_wrong_width_is_rejected(bin_size_bp):
+def test_wrong_output_width_is_rejected(bin_size_bp):
     task = RegressionTask(bin_size_bp)
     shape = (2,) if bin_size_bp is None else (4, 2)
     dataset = [("A" * 512, np.zeros(shape), np.array([]))]
-    model = ModelWithHead(
-        token_outputs={"A" * 512: np.zeros((512, 3))},
-        sequence_outputs={"A" * 512: np.zeros(3)},
-    )
+    model = ModelWithHead({"A" * 512: np.zeros(shape[:-1] + (3,))})
 
     with pytest.raises(ValueError, match="Expected 2 labels"):
         task._eval_dataset(model, dataset)
 
 
-def test_binned_evaluation_rejects_non_3d_token_outputs():
-    task = RegressionTask(128)
-    dataset = [("A" * 512, np.zeros((4, 2)), np.array([]))]
-    model = ModelWithHead(token_outputs={"A" * 512: np.zeros(2)})
-    model.infer_sequence_to_sequence = lambda seqs, ci=None: (None, np.zeros((1, 2)), None)
+def test_wrapper_rejects_non_3d_token_embeddings_when_binned():
+    from usage_examples.trainers import GFMWithProjection
+
+    class Backbone:
+        device = "cpu"
+
+        def infer_sequence_to_sequence(self, sequences, conditional_input=None):
+            return None, np.zeros((len(sequences), 4), np.float32), None
+
+    wrapped = GFMWithProjection(
+        Backbone(), torch.nn.Linear(4, 2), num_labels=2, task_type="regression", num_bins=4
+    )
 
     with pytest.raises(ValueError, match="3 dimensions"):
-        task._eval_dataset(model, dataset)
+        wrapped.infer_sequence_to_regression_outputs(["A" * 512])
 
 
 def test_sequence_level_evaluation_rejects_wrong_ndim():
     task = RegressionTask(None)
     dataset = [("A" * 512, np.zeros(2), np.array([]))]
     model = SimpleNamespace(
-        has_regression_head=True,
-        infer_sequence_to_sequence=lambda seqs, ci=None: (None, None, np.zeros((1, 1, 2))),
+        infer_sequence_to_regression_outputs=lambda seqs, ci=None: np.zeros((1, 1, 2)),
     )
 
     with pytest.raises(ValueError, match="2 dimensions"):
@@ -282,11 +256,12 @@ def test_wrapper_and_finetuner_regression_round_trip():
     head = nn.Linear(hidden, 2)
     wrapped = GFMWithProjection(backbone, head, task_type="regression", num_bins=bins)
     _, tokens, rep = wrapped.infer_sequence_to_sequence(["A" * length, "C" * length])
-    assert tokens.shape == (2, length, 2) and rep.shape == (2, 2)
+    assert tokens.shape == (2, length, hidden) and rep.shape == (2, hidden)
 
-    # Linear head: head-then-pool (wrapper + task) equals pool-then-head.
+    # Linear head: head-then-pool (wrapper) equals pool-then-head.
     task = RegressionTask(4, max_sequence_length=length)
-    preds = task._predict_batch(wrapped, ["A" * length, "C" * length], None, bins, 2)
+    preds = task._predict_batch(wrapped, ["A" * length, "C" * length], None, 2)
+    assert preds.shape == (2, bins, 2)
     pooled_first = head(
         pool_tokens_to_bins(
             torch.from_numpy(backbone.infer_sequence_to_sequence(["A" * length, "C" * length])[1]),
@@ -304,7 +279,7 @@ def test_wrapper_and_finetuner_regression_round_trip():
         num_labels=2, task_type="regression", num_bins=bins,
     )
     wrapped_trained = tuner.fine_tune()
-    assert wrapped_trained.task_type == "regression" and wrapped_trained.has_regression_head
+    assert wrapped_trained.task_type == "regression" and wrapped_trained.projection_layer is not None
     assert seen_conditional and all(c is conditional for c in seen_conditional)
     with pytest.raises(ValueError, match="frozen backbone"):
         GFMFinetuner(backbone, loader, hidden, 2, 1, 1e-2, only_proj_layer=False, task_type="regression")

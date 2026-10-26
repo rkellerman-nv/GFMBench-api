@@ -152,7 +152,7 @@ class BaseGFMTask(ABC):
             "task_type": [str] - prediction objective, such as "classification",
                 or "regression" (supervised tasks)
             "classification_mode": [str] - "single_label" or "multi_label"
-                (only for classification tasks)
+                (regression tasks report "single_label")
             "num_labels": [int] - number of labels for a supervised task
             "num_classes": [int] - number of classes per classification target
             "num_bins": [int] - number of output bins per sequence for regression tasks

@@ -21,7 +21,11 @@ import torch
 import torch.nn as nn
 
 from gfmbench_api.tasks.base.base_gfm_model import BaseGFMModel
-from gfmbench_api.utils.binning import to_float_tensor
+from gfmbench_api.utils.binning import (
+    get_valid_token_counts,
+    pool_tokens_to_bins,
+    to_float_tensor,
+)
 from gfmbench_api.utils.caching_utils import SequenceInferenceCache
 
 
@@ -51,8 +55,8 @@ class GFMWithProjection(BaseGFMModel):
             num_classes: number of classes per target
             cache_size: cache RAM limit in GB; None for unlimited, 0 disables caching
             task_type: "classification" or "regression". In regression mode the
-                projection layer is a regression head and infer_sequence_to_sequence
-                returns its outputs (see infer_sequence_to_sequence).
+                projection layer is a regression head (see
+                infer_sequence_to_regression_outputs).
             num_bins: number of output bins of a regression task (1 = sequence-level)
         """
         self.base_model: BaseGFMModel = base_model
@@ -64,11 +68,6 @@ class GFMWithProjection(BaseGFMModel):
         self.task_type = task_type
         self.num_bins = num_bins
         self._ref_cache = SequenceInferenceCache(max_size_gb=cache_size)
-
-    @property
-    def has_regression_head(self) -> bool:
-        """True when this wrapper holds a trained regression head (read by regression tasks)."""
-        return self.task_type == "regression" and self.projection_layer is not None
 
     def clear_ref_cache(self) -> None:
         """Clear cached reference-sequence inference (call after each benchmark task)."""
@@ -114,17 +113,7 @@ class GFMWithProjection(BaseGFMModel):
     
     def infer_sequence_to_sequence(self, sequences: List[str], conditional_input=None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
         """
-        Sequence-to-sequence inference of the base model.
-
-        In regression mode (``task_type == "regression"`` with a projection layer) the
-        regression head is applied to the base outputs, so regression tasks can read
-        predictions through the public API without a regression-specific method:
-            - sequence_embeddings: [batch_size, seq_len, num_labels] per-token head
-              outputs (only when num_bins > 1; the task pools them into bins)
-            - sequence_representative: [batch_size, num_labels] head output on the
-              sequence embedding
-        sequence_probs is passed through unchanged. Otherwise the base model's outputs
-        are returned as they are.
+        Delegate to the base model's infer_sequence_to_sequence method.
 
         Args:
             sequences: list of DNA strings
@@ -133,25 +122,48 @@ class GFMWithProjection(BaseGFMModel):
         Returns:
             tuple: (sequence_probs, sequence_embeddings, sequence_representative)
         """
-        probs, embeddings, representative = self.base_model.infer_sequence_to_sequence(
+        return self.base_model.infer_sequence_to_sequence(sequences, conditional_input)
+
+    def infer_sequence_to_regression_outputs(self, sequences: List[str], conditional_input=None) -> Optional[np.ndarray]:
+        """
+        Forward pass through the model and the regression head to get regression outputs.
+
+        Sequence-level tasks (``num_bins == 1``) apply the head to the sequence
+        representative. Binned tasks apply the head to the per-token embeddings and
+        mean-pool the per-token outputs into ``num_bins`` bins (see
+        gfmbench_api.utils.binning.pool_tokens_to_bins), using
+        ``sequence_pos_to_prob_pos`` to find each sequence's number of valid tokens.
+
+        Args:
+            sequences: list of DNA strings
+            conditional_input: Optional metadata inputs
+
+        Returns:
+            np.ndarray of shape [batch_size, num_labels] for sequence-level tasks or
+            [batch_size, num_bins, num_labels] for binned tasks. None if this wrapper
+            is not in regression mode with a head, or the base model does not return
+            the embeddings that are needed.
+        """
+        if self.task_type != "regression" or self.projection_layer is None:
+            return None
+        _, embeddings, representative = self.base_model.infer_sequence_to_sequence(
             sequences, conditional_input
         )
-        if not self.has_regression_head:
-            return probs, embeddings, representative
+        values = representative if self.num_bins == 1 else embeddings
+        if values is None:
+            return None
+        with torch.no_grad():
+            outputs = self.projection_layer(to_float_tensor(values, self.device)).float()
+            if self.num_bins > 1:
+                if outputs.ndim != 3:
+                    raise ValueError(
+                        "Expected per-token regression outputs with 3 dimensions "
+                        f"[batch, tokens, labels], but got shape {tuple(outputs.shape)}"
+                    )
+                valid_counts = get_valid_token_counts(self, list(sequences), outputs.shape[1])
+                outputs = pool_tokens_to_bins(outputs, valid_counts, self.num_bins)
+            return outputs.cpu().numpy()
 
-        def apply_head(values: Optional[np.ndarray]) -> Optional[np.ndarray]:
-            if values is None:
-                return None
-            with torch.no_grad():
-                x = to_float_tensor(values, self.device)
-                return self.projection_layer(x).float().cpu().numpy()
-
-        return (
-            probs,
-            apply_head(embeddings) if self.num_bins > 1 else None,
-            apply_head(representative),
-        )
-    
     def sequence_pos_to_prob_pos(self, sequences: List[str], pos: int) -> np.ndarray:
         """
         Delegate to the base model's sequence_pos_to_prob_pos method.

@@ -146,6 +146,7 @@ Simply implement the methods below in your model class; inheritance is **not** r
 |:-------------------------------------------------------------------------------------|:------------------------------------------|
 | `infer_sequence_to_labels_probs(sequences, ...)`                                     | Returns single-label, binary multi-label, or multi-class multi-label probabilities for sequences. |
 | `infer_variant_ref_sequences_to_labels_probs(variant_sequences, ref_sequences, ...)`  | Returns the same classification probability layouts for variant/reference sequence pairs. |
+| `infer_sequence_to_regression_outputs(sequences, ...)`                              | Returns regression predictions (final head outputs) for sequences, per sequence or per bin. Implemented by models that own a regression head, e.g. the `GFMWithProjection` wrapper in `usage_examples/trainers`; not part of `BaseGFMModel`. |
 | `infer_sequence_to_sequence(sequences, ...)`                                         | Takes a list of DNA sequences and returns per-nucleotide probabilities, per-position embeddings, and a single sequence-level embedding. |
 | `sequence_pos_to_prob_pos(sequences, pos)`                                           | Takes a list of DNA sequences and a position index, returns the corresponding output position indices accounting for tokenization differences. |
 | `infer_masked_sequence_to_token_probs(sequences, variant_pos, variant_letters, reference_letters, ...)` | Takes sequences and masks the variant position, returns probabilities for the variant and reference nucleotides at the masked position. |
@@ -154,25 +155,8 @@ Classification probabilities use shape `[batch, classes]` for single-label tasks
 `[batch, labels]` for binary multi-label tasks, and `[batch, labels, classes]`
 for multi-class multi-label tasks.
 
-- **Regression tasks** have no dedicated model method. They use `infer_sequence_to_sequence` (and
-  `sequence_pos_to_prob_pos` for binned tasks). A raw model needs nothing extra: it simply gets
-  `None` metrics. A model that owns a trained regression head (such as the `GFMWithProjection`
-  wrapper in `usage_examples/trainers`) returns the head's outputs in the same slots:
-  `sequence_representative` as `[batch, num_labels]` for sequence-level tasks, and
-  `sequence_embeddings` as per-token `[batch, tokens, num_labels]` for binned tasks. The task
-  mean-pools the per-token outputs into `num_bins` bins by fractional token position, using
-  `sequence_pos_to_prob_pos` on each sequence's last nucleotide to find its valid-token count.
-  A model signals this with a truthy `has_regression_head` attribute; without it the task does not
-  query the model and reports `None` metrics. A declared head whose output width differs from
-  `num_labels` raises an error.
-  - *Limitations of this contract:* the head must be applied per token before pooling (exactly
-    equivalent to pooling first only for a linear head); a nonlinear head applied after pooling is
-    not supported; `overlap` (bp-weighted) pooling is not supported; the valid-token count is
-    approximate for tokenizers whose last nucleotide does not map to the last output position;
-    empty bins are `0` rather than the head's bias; and the example fine-tuner trains regression
-    heads on a frozen backbone only.
 - Any not-implemented methods can simply return `None` and metrics depending on them will be skipped.
-- See `gfmbench_api/tasks/base/base_gfm_model.py` for detailed docstrings.
+- See `gfmbench_api/tasks/base/base_gfm_model.py` for detailed docstrings, and the docstring of `BaseGFMSupervisedRegressionTask` for the regression output contract.
 - Step-by-step tutorial (mock model → NTv3 8M, BEND + GUE): [`usage_examples/add_new_model_tutorial.ipynb`](usage_examples/add_new_model_tutorial.ipynb).
 
 ### Isolated model environments

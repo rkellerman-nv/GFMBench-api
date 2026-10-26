@@ -18,13 +18,11 @@ from abc import abstractmethod
 from typing import Any, Dict, Optional
 
 import numpy as np
-import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from gfmbench_api.metrics import RegressionPearsonR, RegressionR2
 from gfmbench_api.tasks.base.base_gfm_supervised_task import BaseGFMSupervisedTask
-from gfmbench_api.utils.binning import get_valid_token_counts, pool_tokens_to_bins
 
 
 class BaseGFMSupervisedRegressionTask(BaseGFMSupervisedTask):
@@ -32,22 +30,21 @@ class BaseGFMSupervisedRegressionTask(BaseGFMSupervisedTask):
     Base class for sequence-level and binned regression tasks (e.g. CAGE).
 
     Dataset format: (sequence, label, conditional_input) tuples
-    Model inference: infer_sequence_to_sequence(sequences, conditional_input) and, for binned
-    tasks, sequence_pos_to_prob_pos(sequences, pos). There is no regression-specific model
-    method. A model that owns a trained regression head (e.g. a fine-tuning wrapper) returns
-    the head's outputs in the slots of infer_sequence_to_sequence:
-        - sequence_representative: [batch_size, num_labels], used by sequence-level tasks
-        - sequence_embeddings: [batch_size, num_tokens, num_labels] per-token head outputs,
-          used by binned tasks. The task pools them into bins (see
-          gfmbench_api.utils.binning.pool_tokens_to_bins), using sequence_pos_to_prob_pos
-          to find each sequence's number of valid tokens.
-    A model signals that it owns a regression head with a truthy ``has_regression_head``
-    attribute. A model without it (e.g. a raw backbone returning hidden embeddings) is not
-    queried and its metrics are None. A model that declares a head but returns outputs
-    whose width differs from num_labels raises ValueError.
+    Model inference: infer_sequence_to_regression_outputs(sequences, conditional_input),
+    returning the final predictions of the model's regression head. It is not part of
+    BaseGFMModel; a model (e.g. a fine-tuning wrapper) that owns a regression head implements
+    it and is responsible for any per-token head application and pooling into bins (see
+    gfmbench_api.utils.binning.pool_tokens_to_bins and sequence_pos_to_prob_pos).
+    The model is queried through the safe model call, as in classification: if it does not
+    implement the method or returns None, the task's metrics are None. Outputs whose width
+    differs from num_labels raise ValueError.
 
     Not supported by this contract: heads applied after pooling (e.g. an MLP head on pooled
-    bin embeddings), pooling by bp overlap, and full fine-tuning of the backbone.
+    bin embeddings), pooling by bp overlap, and full fine-tuning of the backbone. The
+    reference wrapper applies the head per token before pooling (equivalent to pooling first
+    only for a linear head); its valid-token count is approximate for tokenizers whose last
+    nucleotide does not map to the last output position, and empty bins are 0 rather than
+    the head's bias.
 
     The bin size determines the label and prediction layout:
         - get_bin_size_bp() is None: sequence-level, [batch_size, num_labels] -
@@ -77,6 +74,8 @@ class BaseGFMSupervisedRegressionTask(BaseGFMSupervisedTask):
             "has_validation_data": self.validation_dataset is not None,
             "num_labels": self._validate_num_labels(),
             "task_type": "regression",
+            "classification_mode": "single_label",
+            "is_variant_effect_prediction": False,
             "num_bins": self._get_num_bins(),
             "conditional_input_metadata": self.get_conditional_input_meta_data_frame(),
         }
@@ -117,41 +116,24 @@ class BaseGFMSupervisedRegressionTask(BaseGFMSupervisedTask):
         model: Any,
         sequences: Any,
         conditional_input: Any,
-        num_bins: int,
         num_labels: int,
     ) -> Optional[np.ndarray]:
-        """Return regression predictions for a batch, or None if the model has no regression head.
+        """Return regression predictions for a batch, or None if the model does not provide them.
 
-        A model has a regression head only if it sets a truthy ``has_regression_head``
-        attribute; other models are skipped before any inference, token mapping or pooling.
+        The model is queried through ``_safe_model_call``, so a model that does not
+        implement ``infer_sequence_to_regression_outputs`` (or returns None) is skipped
+        and its metrics are None.
 
         Shape: [batch_size, num_labels] for sequence-level tasks,
         [batch_size, num_bins, num_labels] for binned tasks.
         """
-        if not getattr(model, "has_regression_head", False):
-            return None
-        # Called directly: a model that declares a head must not have real failures
-        # (OOM, shape errors) swallowed and scored as "no head".
-        _, token_outputs, sequence_output = model.infer_sequence_to_sequence(
-            sequences, conditional_input
+        (preds,) = self._safe_model_call(
+            model,
+            "infer_sequence_to_regression_outputs",
+            sequences,
+            conditional_input,
+            num_outputs=1,
         )
-        if num_bins == 1:
-            preds = sequence_output
-        elif token_outputs is None:
-            preds = None
-        else:
-            token_outputs = torch.as_tensor(np.asarray(token_outputs), dtype=torch.float32)
-            if token_outputs.ndim != 3:
-                raise ValueError(
-                    "Expected per-token regression outputs with 3 dimensions "
-                    f"[batch, tokens, labels], but got shape {tuple(token_outputs.shape)}"
-                )
-            if token_outputs.shape[-1] != num_labels:
-                raise ValueError(
-                    f"Expected {num_labels} labels, but got {token_outputs.shape[-1]}"
-                )
-            valid_counts = get_valid_token_counts(model, list(sequences), token_outputs.shape[1])
-            preds = pool_tokens_to_bins(token_outputs, valid_counts, num_bins).numpy()
         if preds is None:
             return None
         preds = np.asarray(preds)
@@ -164,8 +146,8 @@ class BaseGFMSupervisedRegressionTask(BaseGFMSupervisedTask):
         Evaluate the model on the given dataset.
 
         Args:
-            model: Model instance to evaluate (must implement infer_sequence_to_sequence
-                and sequence_pos_to_prob_pos; see the class docstring for the output contract)
+            model: Model instance to evaluate (must implement infer_sequence_to_regression_outputs;
+                see the class docstring for the output contract)
             dataset: The dataset to evaluate on.
 
         Returns:
@@ -189,7 +171,7 @@ class BaseGFMSupervisedRegressionTask(BaseGFMSupervisedTask):
         for sequences, labels, conditional_input in tqdm(data_loader, desc="Evaluating"):
             # Shape: [batch_size, num_labels] for sequence-level tasks,
             # [batch_size, num_bins, num_labels] for binned tasks
-            preds = self._predict_batch(model, sequences, conditional_input, num_bins, num_labels)
+            preds = self._predict_batch(model, sequences, conditional_input, num_labels)
             labels_np = (
                 labels.detach().cpu().numpy()
                 if hasattr(labels, "detach")
