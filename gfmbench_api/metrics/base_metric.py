@@ -52,6 +52,32 @@ class BaseMetric(ABC):
         """
         self._none_warned = False
     
+    def _state_names(self):
+        """Names of the per-batch accumulator lists (every ``list`` attribute)."""
+        return sorted(name for name, value in vars(self).items() if isinstance(value, list))
+
+    def state_lengths(self):
+        """Current length of every accumulator list, used as a marker for ``state_since``."""
+        extra = sorted(n for n, v in vars(self).items() if not isinstance(v, list) and n != "_none_warned")
+        if extra:
+            raise TypeError(
+                f"{self.name}: per-batch state export only supports list attributes, found {extra}"
+            )
+        return {name: len(getattr(self, name)) for name in self._state_names()}
+
+    def state_since(self, lengths):
+        """Accumulator entries appended after the ``state_lengths()`` marker was taken."""
+        return {name: list(getattr(self, name)[start:]) for name, start in lengths.items()}
+
+    def extend_state(self, delta):
+        """Append entries exported by ``state_since`` (possibly from another process)."""
+        names = set(self._state_names())
+        unknown = set(delta) - names
+        if unknown:
+            raise KeyError(f"{self.name}: unknown metric state {sorted(unknown)}")
+        for name, items in delta.items():
+            getattr(self, name).extend(items)
+
     def calc(self, *args, **kwargs):
         """
         Template method: checks for None inputs and delegates to _calc_impl().

@@ -77,7 +77,10 @@ class VepevalClinvarTask(BaseGFMZeroShotSNVTask):
         return "clinvar_vep_eval"
 
     def use_reference_cache(self) -> bool:
-        return True
+        # Reference sequences almost never repeat here (cache hits: 1.9% of 259k samples), while each
+        # cached entry holds a full [L, hidden_dim] embedding (~1.6 MB), so the
+        # cache costs far more RAM and copy time than the inference it saves.
+        return False
 
     def _create_test_dataset(self):
         """

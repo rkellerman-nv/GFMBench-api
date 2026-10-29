@@ -77,7 +77,10 @@ class SonglabClinvarTask(BaseGFMZeroShotSNVTask):
         return "songlab_clinvar"
 
     def use_reference_cache(self) -> bool:
-        return True
+        # Reference sequences almost never repeat here (cache hits: 0.1% of 41k samples), while each
+        # cached entry holds a full [L, hidden_dim] embedding (~1.6 MB), so the
+        # cache costs far more RAM and copy time than the inference it saves.
+        return False
 
     def _get_default_max_seq_len(self) -> int:
         """Return the task's default maximum sequence length.

@@ -111,6 +111,10 @@ class BaseGFMZeroShotSNVTask(BaseGFMZeroShotTask):
             args = [outputs[key] for key in arg_keys]
             metric.calc(*args)
 
+    def _get_prefetch_variant_pos(self) -> Optional[int]:
+        """SNV tasks mask and map the variant position, so models can prefetch for it."""
+        return self._get_variant_position_in_sequence()
+
     def _is_snv_only(self) -> bool:
         """Return True since this handles only SNV variants."""
         return True

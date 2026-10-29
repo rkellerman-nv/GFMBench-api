@@ -44,6 +44,7 @@ from torch.utils.data import DataLoader
 from gfmbench_api.utils import logutils
 
 from gfmbench_api.benchmark_report import BenchmarkReport
+from gfmbench_api.tasks.base.base_gfm_zero_shot_task import BaseGFMZeroShotTask
 from gfmbench_api.tasks.concrete.bend_vep_disease_task import BendVEPDisease
 from gfmbench_api.tasks.concrete.bend_vep_expression_task import BendVEPExpression
 from gfmbench_api.tasks.concrete.gue_promoter_all_task import GuePromoterAllTask
@@ -221,11 +222,57 @@ def parse_args(argv=None):
         help="If set, limit each dataset to 100 samples for quick testing.",
     )
     parser.add_argument(
+        "--max_num_samples",
+        type=int,
+        default=None,
+        help="Limit each dataset to this many samples (default: use full datasets). "
+             "Overrides the 100-sample limit of --sanity_check_mode.",
+    )
+    parser.add_argument(
+        "--tasks",
+        nargs="*",
+        default=None,
+        metavar="TASK",
+        help="Run only these tasks (default: all registered tasks). "
+             "Applied before --exclude_tasks.",
+    )
+    parser.add_argument(
         "--exclude_tasks",
         nargs="*",
         default=[],
         metavar="TASK",
         help="Task names to skip (e.g. --exclude_tasks vepeval_clinvar).",
+    )
+    parser.add_argument(
+        "--shard_rank",
+        type=int,
+        default=0,
+        help="Index of this process among --shard_world processes that split each "
+             "zero-shot task's batches (see run_benchmark_parallel.py; default: 0).",
+    )
+    parser.add_argument(
+        "--shard_world",
+        type=int,
+        default=1,
+        help="Number of processes sharing each zero-shot task (default: 1 = no sharding). "
+             "Requires --shard_dir and only zero-shot tasks.",
+    )
+    parser.add_argument(
+        "--shard_run_id",
+        type=str,
+        default=None,
+        help="Token shared by all shards of one launch; shard files from other runs are ignored.",
+    )
+    parser.add_argument(
+        "--shard_dir",
+        type=str,
+        default=None,
+        help="Directory where shards exchange per-batch metric state.",
+    )
+    parser.add_argument(
+        "--disable_prefetch",
+        action="store_true",
+        help="Do not overlap next-batch tokenization with GPU inference (for A/B timing).",
     )
     return parser.parse_args(argv)
 
@@ -293,6 +340,12 @@ def main(argv=None):
     checkpoint_path = args.checkpoint_path
 
 
+    if args.shard_world > 1 and not (args.shard_dir and args.shard_run_id):
+        raise ValueError("--shard_world > 1 requires --shard_dir and --shard_run_id.")
+    unknown_tasks = set(args.tasks or []) - set(TASK_REGISTRY)
+    if unknown_tasks:
+        raise ValueError(f"Unknown task name(s): {sorted(unknown_tasks)}")
+
     if args.model == "Evo2" and not args.linear_prob:
         raise ValueError("Evo2 does not support full fine-tuning. Use --linear_prob for Evo2 benchmarks.")
     ModelClass = get_model_class(args.model)
@@ -317,7 +370,15 @@ def main(argv=None):
         "max_num_samples": None,
         "disable_safe_model_call": args.disable_safe_model_call,
         "cache_size": args.cache_size,
+        "prefetch": not args.disable_prefetch,
     }
+    if args.shard_world > 1:
+        task_config["shard"] = {
+            "rank": args.shard_rank,
+            "world": args.shard_world,
+            "dir": args.shard_dir,
+            "run_id": args.shard_run_id,
+        }
 
     if args.cache_size is None:
         logging.warning(
@@ -327,7 +388,10 @@ def main(argv=None):
     else:
         logging.info(f"cache_size={args.cache_size} GB")
 
-    if args.sanity_check_mode:
+    if args.max_num_samples is not None:
+        task_config["max_num_samples"] = args.max_num_samples
+        logging.info(f"Limiting to {args.max_num_samples} samples per dataset")
+    elif args.sanity_check_mode:
         task_config["max_num_samples"] = 100
         logging.info("SANITY CHECK MODE: Limiting to 100 samples per dataset")
     else:
@@ -337,7 +401,7 @@ def main(argv=None):
     tasks = [
         cls(root_data_dir_path=root_data_dir_path, task_config=task_config)
         for name, cls in TASK_REGISTRY.items()
-        if name not in args.exclude_tasks
+        if (args.tasks is None or name in args.tasks) and name not in args.exclude_tasks
     ]
 
     # Training parameters for fine-tuning tasks
@@ -371,6 +435,11 @@ def main(argv=None):
         # Get task attributes
         task_attrs = task.get_task_attributes()
         has_finetuning_data = task_attrs.get("has_finetuning_data", False)
+        if args.shard_world > 1 and (has_finetuning_data or not isinstance(task, BaseGFMZeroShotTask)):
+            raise ValueError(
+                f"Task '{task_name}' is not a zero-shot task and cannot be sharded; "
+                "run it with --shard_world 1."
+            )
 
         # Re-seed before each task for deterministic model/projection initialization
         set_seed(seed)
@@ -440,15 +509,22 @@ def main(argv=None):
         logging.info("Evaluating...")
         test_model.eval()
         scores = task.eval_test_set(test_model)
-        logging.info(f"Test scores for {task_name}: {scores}")
 
         if hasattr(test_model, "clear_ref_cache"):
             test_model.clear_ref_cache()
 
-        # Add scores to report and save immediately
-        report.add_scores(task_name, report_algo_name, scores)
-        report.save_csv()
-        logging.info(f"Saved progress to: {csv_path}")
+        if scores is None:
+            # Sharded run: another shard finishes last and reports the merged scores.
+            logging.info(
+                f"Shard {args.shard_rank}/{args.shard_world} of '{task_name}' done; "
+                "scores are reported by the last shard to finish."
+            )
+        else:
+            logging.info(f"Test scores for {task_name}: {scores}")
+            # Add scores to report and save immediately
+            report.add_scores(task_name, report_algo_name, scores)
+            report.save_csv()
+            logging.info(f"Saved progress to: {csv_path}")
 
         task_elapsed = time.perf_counter() - task_start
         logging.info(

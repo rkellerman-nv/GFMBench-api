@@ -19,6 +19,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from torch.utils.data import Dataset, Subset
 import pandas as pd
 
+from gfmbench_api.utils.sharding import ShardSpec
+
 
 class BaseGFMTask(ABC):
 
@@ -41,6 +43,10 @@ class BaseGFMTask(ABC):
                            If None or not provided, all samples are loaded.
                          - "cache_size": float or None - cache RAM limit in GB (default: None = unlimited).
                            0 disables inference caching.
+                         - "prefetch": bool - let zero-shot tasks hand the next batch to the model's optional
+                           ``prefetch_batch`` hook so host-side preprocessing overlaps GPU work (default: True).
+                         - "shard": dict or None - {"rank", "world", "dir"}; evaluate only this shard's batches
+                           of a zero-shot test set and merge via files in "dir" (see utils/sharding.py).
         """
         self.root_data_dir_path: str = root_data_dir_path
         self.task_config: Optional[Dict[str, Any]] = task_config or {}
@@ -60,6 +66,9 @@ class BaseGFMTask(ABC):
         # Extract cache_size from task_config (default: None = unlimited)
         self.cache_size: Optional[float] = self.task_config.get("cache_size", None)
         
+        self.prefetch: bool = self.task_config.get("prefetch", True)
+        self.shard: Optional[ShardSpec] = ShardSpec.from_config(self.task_config.get("shard"))
+
         # Compute effective max_sequence_length
         self.max_sequence_length: int = self._get_max_sequence_length()
 

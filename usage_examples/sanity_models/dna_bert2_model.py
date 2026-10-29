@@ -15,12 +15,15 @@
 
 # Third-party URL notices for this file (Python packages: THIRD_PARTY_NOTICES.md):
 # - https://huggingface.co/zhihan1996/DNABERT-2-117M — Apache-2.0
+import copy
 from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 from transformers import AutoConfig, AutoModelForMaskedLM, AutoTokenizer
+
+from gfmbench_api.utils.inference_utils import BackgroundPrefetcher, tensor_to_numpy
 
 
 class DNABERT2Model(nn.Module):
@@ -84,6 +87,8 @@ class DNABERT2Model(nn.Module):
         self.model.to(device)
 
         self.cls_index = 0
+        self._prefetcher = BackgroundPrefetcher()
+        self._prefetch_tokenizer = None
         self.hidden_dim = self.model.bert.config.hidden_size
         self.mlm_head_loaded = True
 
@@ -149,14 +154,81 @@ class DNABERT2Model(nn.Module):
     def load_state_dict(self, state_dict, strict: bool = True):
         return self.model.load_state_dict(state_dict, strict=strict)
 
-    def tokenize(self, sequences):
-        encoded = self.tokenizer(
+    @staticmethod
+    def _encode(tokenizer, sequences, max_length):
+        return tokenizer(
             sequences,
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=self.max_length,
+            max_length=max_length,
         )
+
+    @classmethod
+    def _encode_masked(cls, tokenizer, sequences, variant_pos, max_length):
+        masked_sequences = [
+            seq[:variant_pos] + tokenizer.mask_token + seq[variant_pos + 1 :] for seq in sequences
+        ]
+        return cls._encode(tokenizer, masked_sequences, max_length)
+
+    @staticmethod
+    def _offset_mappings(tokenizer, sequences):
+        return tokenizer(
+            list(sequences), return_offsets_mapping=True, add_special_tokens=True
+        )["offset_mapping"]
+
+    def _take_prefetched(self, kind, sequences, *extra):
+        """Return the result prefetched for this exact input, or None (caller computes it)."""
+        if not self._prefetcher.has_pending:
+            return None
+        try:
+            # max_length is part of the key so a changed length can never hit a stale entry.
+            return self._prefetcher.take((kind, self.max_length, *extra, tuple(sequences)))
+        except TypeError:  # unhashable input: let the inline path handle it as before
+            return None
+
+    def prefetch_batch(self, variant_sequences, reference_sequences=None, variant_pos=None):
+        """Tokenize an upcoming batch on a background thread while the GPU is busy.
+
+        Optional hook called by the zero-shot tasks with the *next* batch. Tokenization is
+        deterministic, so consuming a prefetched result is identical to tokenizing inline;
+        any miss or failure silently falls back to the inline path. The worker uses its own
+        tokenizer copy because fast tokenizers mutate shared state on every call.
+        """
+        if torch.device(self.device).type == "cpu":
+            return
+        try:
+            self._prefetcher.new_generation()
+            if self._prefetch_tokenizer is None:
+                self._prefetch_tokenizer = copy.deepcopy(self.tokenizer)
+            tokenizer = self._prefetch_tokenizer
+            max_length = self.max_length
+            for sequences in (variant_sequences, reference_sequences):
+                if sequences is None:
+                    continue
+                sequences = list(sequences)
+                self._prefetcher.submit(
+                    ("encode", max_length, tuple(sequences)),
+                    self._encode, tokenizer, sequences, max_length,
+                )
+                if variant_pos is not None:
+                    self._prefetcher.submit(
+                        ("offsets", max_length, tuple(sequences)),
+                        self._offset_mappings, tokenizer, sequences,
+                    )
+            if variant_pos is not None and variant_sequences is not None:
+                sequences = list(variant_sequences)
+                self._prefetcher.submit(
+                    ("masked", max_length, variant_pos, tuple(sequences)),
+                    self._encode_masked, tokenizer, sequences, variant_pos, max_length,
+                )
+        except Exception:
+            self._prefetcher.clear()
+
+    def tokenize(self, sequences):
+        encoded = self._take_prefetched("encode", sequences)
+        if encoded is None:
+            encoded = self._encode(self.tokenizer, sequences, self.max_length)
         return {key: val.to(self.device) for key, val in encoded.items()}
 
     def _sequence_to_representative(self, sequences):
@@ -177,20 +249,24 @@ class DNABERT2Model(nn.Module):
 
         return (
             None,
-            hidden_states_seq.detach().cpu().numpy(),
+            tensor_to_numpy(hidden_states_seq),
             sequence_representative.detach().cpu().numpy(),
         )
 
     def sequence_pos_to_prob_pos(self, sequences, pos):
         batch_size = len(sequences)
         output_positions = np.zeros(batch_size, dtype=np.int32)
+        prefetched_offsets = self._take_prefetched("offsets", sequences)
 
         for i, seq in enumerate(sequences):
             try:
-                encoded_with_offsets = self.tokenizer(
-                    seq, return_offsets_mapping=True, add_special_tokens=True
-                )
-                offset_mapping = encoded_with_offsets["offset_mapping"]
+                if prefetched_offsets is not None:
+                    offset_mapping = prefetched_offsets[i]
+                else:
+                    encoded_with_offsets = self.tokenizer(
+                        seq, return_offsets_mapping=True, add_special_tokens=True
+                    )
+                    offset_mapping = encoded_with_offsets["offset_mapping"]
 
                 token_idx = -1
                 for idx, (start, end) in enumerate(offset_mapping):
@@ -228,18 +304,9 @@ class DNABERT2Model(nn.Module):
 
         batch_size = len(sequences)
 
-        masked_sequences = []
-        for seq in sequences:
-            masked_seq = seq[:variant_pos] + self.tokenizer.mask_token + seq[variant_pos + 1 :]
-            masked_sequences.append(masked_seq)
-
-        encoded = self.tokenizer(
-            masked_sequences,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-        )
+        encoded = self._take_prefetched("masked", sequences, variant_pos)
+        if encoded is None:
+            encoded = self._encode_masked(self.tokenizer, sequences, variant_pos, self.max_length)
         encoded = {key: val.to(self.device) for key, val in encoded.items()}
 
         mask_token_id = self.tokenizer.mask_token_id

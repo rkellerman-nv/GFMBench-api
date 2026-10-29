@@ -60,6 +60,10 @@ class GFMWithProjection(BaseGFMModel):
         """Clear cached reference-sequence inference (call after each benchmark task)."""
         self._ref_cache.clear()
 
+    def _infer_representative(self, sequences: List[str], conditional_input=None) -> Optional[np.ndarray]:
+        """Sequence representative only; cached instead of the full per-position embeddings."""
+        return self.base_model.infer_sequence_to_sequence(sequences, conditional_input)[2]
+
     def _logits_to_probs(self, logits: torch.Tensor) -> np.ndarray:
         """Convert projection logits to the task's classification probability layout."""
         if self.num_labels == 1:
@@ -210,8 +214,8 @@ class GFMWithProjection(BaseGFMModel):
         _, _, var_repr_np = self.base_model.infer_sequence_to_sequence(
             variant_sequences, conditional_input
         )
-        _, _, ref_repr_np = self._ref_cache.cached_call(
-            self.base_model.infer_sequence_to_sequence,
+        ref_repr_np = self._ref_cache.cached_call(
+            self._infer_representative,
             ref_sequences,
             conditional_input,
             disable=self.cache_size == 0,

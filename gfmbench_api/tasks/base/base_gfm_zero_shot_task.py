@@ -19,7 +19,7 @@ from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 
 from gfmbench_api.metrics import (
@@ -32,6 +32,15 @@ from gfmbench_api.metrics import (
 )
 from gfmbench_api.tasks.base.base_gfm_task import BaseGFMTask
 from gfmbench_api.utils.caching_utils import SequenceInferenceCache
+from gfmbench_api.utils.sharding import (
+    ShardSpec,
+    dataset_fingerprint,
+    load_all_shards,
+    num_batches,
+    shard_batch_ids,
+    shard_sample_indices,
+    write_shard,
+)
 
 
 class BaseGFMZeroShotTask(BaseGFMTask):
@@ -82,7 +91,33 @@ class BaseGFMZeroShotTask(BaseGFMTask):
         test_dataset = self._create_test_dataset()
         return None, None, test_dataset
 
-    def _eval_dataset(self, model: Any, dataset: Any) -> Dict[str, Optional[float]]:
+    def eval_test_set(self, model: Any) -> Optional[Dict[str, Optional[float]]]:
+        """Evaluate on the test set; in sharded mode only this shard's batches are run.
+
+        Returns the scores, or ``None`` when sharded and other shards are still running.
+        Normally only the last shard to finish merges and returns the scores; if several
+        finish together they may all return the same (identical) scores.
+        """
+        return self._eval_dataset(model, self.test_dataset, shard=self.shard)
+
+    def _get_prefetch_variant_pos(self) -> Optional[int]:
+        """Variant position to hand to the model's prefetch hook (None for non-SNV tasks)."""
+        return None
+
+    def _prefetch_batch(self, model: Any, batch_data: Any) -> None:
+        """Offer an upcoming batch to the model's optional ``prefetch_batch`` hook."""
+        prefetch = getattr(model, "prefetch_batch", None)
+        if prefetch is None:
+            return
+        variant_sequences, reference_sequences = batch_data[0], batch_data[1]
+        try:
+            prefetch(variant_sequences, reference_sequences, self._get_prefetch_variant_pos())
+        except Exception:
+            pass  # prefetching is an optimization; the inline path still computes everything
+
+    def _eval_dataset(
+        self, model: Any, dataset: Any, shard: Optional[ShardSpec] = None
+    ) -> Optional[Dict[str, Optional[float]]]:
         """
         Evaluate the model using zero-shot methods for variant pathogenicity prediction.
         Binary classification task (benign=0, pathogenic=1).
@@ -96,72 +131,103 @@ class BaseGFMZeroShotTask(BaseGFMTask):
         Args:
             model: Any object with inference methods (should be in eval mode).
             dataset: The dataset to evaluate on.
+            shard: If given, evaluate only this shard's batches and merge through files
+                (see utils/sharding.py).
         
         Returns:
-            dict: Scores with metric names as keys.
+            dict: Scores with metric names as keys; ``None`` for a shard that is not the
+            last one to finish.
         """
-        # Create dataloader from dataset
+        # Create dataloader from dataset (in sharded mode: only this shard's whole batches)
+        shard_batches: List[int] = []
+        loader_dataset = dataset
+        if shard is not None:
+            shard_batches = shard_batch_ids(len(dataset), self.batch_size, shard)
+            loader_dataset = Subset(
+                dataset, shard_sample_indices(len(dataset), self.batch_size, shard)
+            )
         data_loader = DataLoader(
-            dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers
+            loader_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers
         )
         
-        # Define common metrics with their argument keys
-        # Each entry: (metric, arg_keys) where arg_keys specifies which outputs to pass
-        common_metrics = [
-            (SumProbsLLRAUROC(), ('variant_probs', 'reference_probs', 'labels')),
-            (SumProbsLLRAUPRC(), ('variant_probs', 'reference_probs', 'labels')),
-            (SequenceEmbeddingsCosineSimAUROC(), ('variant_repr', 'reference_repr', 'labels')),
-            (SequenceEmbeddingsCosineSimAUPRC(), ('variant_repr', 'reference_repr', 'labels')),
-            (SequenceEmbeddingsL2AUROC(), ('variant_repr', 'reference_repr', 'labels')),
-            (SequenceEmbeddingsL2AUPRC(), ('variant_repr', 'reference_repr', 'labels')),
-        ]
+        common_metrics = self._common_metrics()
         
         # Get additional metrics from subclass
         additional_metrics = self._get_additional_metrics()
 
+        all_metrics = [metric for metric, _ in common_metrics + additional_metrics]
+        shard_records: Dict[int, Dict[str, Any]] = {}
+
         ref_cache = SequenceInferenceCache(max_size_gb=self.cache_size)
-        for batch_data in tqdm(data_loader, desc="Evaluating (Zero-Shot)"):
-            variant_sequences, reference_sequences, labels, conditional_input = batch_data
+        batches = iter(data_loader)
+        batch_data = next(batches, None)
+        if batch_data is not None and self.prefetch:
+            self._prefetch_batch(model, batch_data)
+        progress = tqdm(total=len(data_loader), desc="Evaluating (Zero-Shot)")
+        batch_pos = 0
+        try:
+            while batch_data is not None:
+                # Hand the next batch to the model first so its host-side preprocessing
+                # overlaps with the GPU work for the current batch.
+                upcoming = next(batches, None)
+                if upcoming is not None and self.prefetch:
+                    self._prefetch_batch(model, upcoming)
+                marks = [metric.state_lengths() for metric in all_metrics] if shard is not None else None
 
-            # Get sequence-to-sequence outputs for both variant and reference
-            # Returns: (sequence_probs, sequence_embeddings, sequence_representative)
-            variant_probs_np, variant_embeddings_np, variant_repr_np = self._safe_model_call(
-                model, 'infer_sequence_to_sequence', variant_sequences, conditional_input, num_outputs=3
-            )
-            infer_ref = partial(
-                self._safe_model_call, model, 'infer_sequence_to_sequence', num_outputs=3
-            )
-            reference_probs_np, reference_embeddings_np, reference_repr_np = ref_cache.cached_call(
-                infer_ref,
-                reference_sequences,
-                conditional_input,
-                disable=(self.cache_size == 0) or not self.use_reference_cache(),
-            )
+                variant_sequences, reference_sequences, labels, conditional_input = batch_data
 
-            # Build outputs dict for metric argument lookup
-            outputs = {
-                'variant_probs': variant_probs_np,
-                'reference_probs': reference_probs_np,
-                'variant_embeddings': variant_embeddings_np,
-                'reference_embeddings': reference_embeddings_np,
-                'variant_repr': variant_repr_np,
-                'reference_repr': reference_repr_np,
-                'labels': labels,
-            }
+                # Get sequence-to-sequence outputs for both variant and reference
+                # Returns: (sequence_probs, sequence_embeddings, sequence_representative)
+                variant_probs_np, variant_embeddings_np, variant_repr_np = self._safe_model_call(
+                    model, 'infer_sequence_to_sequence', variant_sequences, conditional_input, num_outputs=3
+                )
+                infer_ref = partial(
+                    self._safe_model_call, model, 'infer_sequence_to_sequence', num_outputs=3
+                )
+                reference_probs_np, reference_embeddings_np, reference_repr_np = ref_cache.cached_call(
+                    infer_ref,
+                    reference_sequences,
+                    conditional_input,
+                    disable=(self.cache_size == 0) or not self.use_reference_cache(),
+                )
 
-            # Update common metrics using their specified argument keys
-            for metric, arg_keys in common_metrics:
-                args = [outputs[key] for key in arg_keys]
-                metric.calc(*args)
+                # Build outputs dict for metric argument lookup
+                outputs = {
+                    'variant_probs': variant_probs_np,
+                    'reference_probs': reference_probs_np,
+                    'variant_embeddings': variant_embeddings_np,
+                    'reference_embeddings': reference_embeddings_np,
+                    'variant_repr': variant_repr_np,
+                    'reference_repr': reference_repr_np,
+                    'labels': labels,
+                }
 
-            # Update additional metrics (subclass handles this)
-            self._update_additional_metrics(
-                additional_metrics, model,
-                variant_sequences, reference_sequences, labels,
-                outputs
-            )
+                # Update common metrics using their specified argument keys
+                for metric, arg_keys in common_metrics:
+                    args = [outputs[key] for key in arg_keys]
+                    metric.calc(*args)
 
-        ref_cache.clear()
+                # Update additional metrics (subclass handles this)
+                self._update_additional_metrics(
+                    additional_metrics, model,
+                    variant_sequences, reference_sequences, labels,
+                    outputs
+                )
+
+                if shard is not None:
+                    shard_records[shard_batches[batch_pos]] = {
+                        metric.name: metric.state_since(mark)
+                        for metric, mark in zip(all_metrics, marks)
+                    }
+                batch_pos += 1
+                progress.update(1)
+                batch_data = upcoming
+        finally:
+            progress.close()
+            ref_cache.clear()
+
+        if shard is not None:
+            return self._finish_shard(shard, dataset, shard_records, common_metrics, additional_metrics)
 
         # Aggregate results from all metrics
         results = {}
@@ -171,6 +237,62 @@ class BaseGFMZeroShotTask(BaseGFMTask):
             results[metric.name] = metric.get_final_results()
         
         return results
+
+    @staticmethod
+    def _common_metrics() -> List[tuple]:
+        """Fresh metric objects shared by all zero-shot tasks, with their argument keys.
+
+        Each entry is (metric, arg_keys) where arg_keys specifies which outputs to pass.
+        """
+        return [
+            (SumProbsLLRAUROC(), ('variant_probs', 'reference_probs', 'labels')),
+            (SumProbsLLRAUPRC(), ('variant_probs', 'reference_probs', 'labels')),
+            (SequenceEmbeddingsCosineSimAUROC(), ('variant_repr', 'reference_repr', 'labels')),
+            (SequenceEmbeddingsCosineSimAUPRC(), ('variant_repr', 'reference_repr', 'labels')),
+            (SequenceEmbeddingsL2AUROC(), ('variant_repr', 'reference_repr', 'labels')),
+            (SequenceEmbeddingsL2AUPRC(), ('variant_repr', 'reference_repr', 'labels')),
+        ]
+
+    def _finish_shard(
+        self,
+        shard: ShardSpec,
+        dataset: Any,
+        shard_records: Dict[int, Dict[str, Any]],
+        common_metrics: List[tuple],
+        additional_metrics: List[tuple],
+    ) -> Optional[Dict[str, Optional[float]]]:
+        """Publish this shard's metric state; if every shard is done, merge and score."""
+        write_shard(shard, self.get_task_name(), {
+            "fingerprint": dataset_fingerprint(dataset),
+            "num_samples": len(dataset),
+            "batch_size": self.batch_size,
+            "batches": shard_records,
+        })
+        shards = load_all_shards(shard, self.get_task_name())
+        if shards is None:
+            return None
+
+        expected = {key: shards[0][key] for key in ("fingerprint", "num_samples", "batch_size")}
+        for payload in shards:
+            if any(payload[key] != value for key, value in expected.items()):
+                raise RuntimeError(
+                    f"Shards of task '{self.get_task_name()}' were produced from different "
+                    "datasets or batch sizes; clear the shard directory and rerun."
+                )
+        merged: Dict[int, Dict[str, Any]] = {}
+        for payload in shards:
+            if merged.keys() & payload["batches"].keys():
+                raise RuntimeError(f"Duplicate batches across shards of '{self.get_task_name()}'.")
+            merged.update(payload["batches"])
+        if sorted(merged) != list(range(num_batches(len(dataset), self.batch_size))):
+            raise RuntimeError(f"Shards of '{self.get_task_name()}' do not cover every batch.")
+
+        # Fresh metrics fed with the shard states in original batch order.
+        results_metrics = [metric for metric, _ in self._common_metrics() + self._get_additional_metrics()]
+        for batch_id in sorted(merged):
+            for metric in results_metrics:
+                metric.extend_state(merged[batch_id][metric.name])
+        return {metric.name: metric.get_final_results() for metric in results_metrics}
 
     @abstractmethod
     def use_reference_cache(self) -> bool:
