@@ -15,6 +15,7 @@
 
 # This module does not embed third-party data download URLs.
 import argparse
+import gc
 import importlib
 import logging
 import os
@@ -354,10 +355,19 @@ def main(argv=None):
     
     logging.info(f"Model: {args.model}, Max sequence length: {max_length}")
     
-    # Initialize model (will be reinitialized per task)
-    model = ModelClass(device=device, max_length=max_length, **model_init_kwargs)
-    if checkpoint_path:
-        model.load_checkpoint(checkpoint_path)
+    def build_model():
+        """Create a fresh model (and load the checkpoint, if any)."""
+        new_model = ModelClass(device=device, max_length=max_length, **model_init_kwargs)
+        if checkpoint_path:
+            logging.info(f"Loading checkpoint: {checkpoint_path}")
+            new_model.load_checkpoint(checkpoint_path)
+        return new_model
+
+    def release_model() -> None:
+        """Free GPU memory held by models that were just dropped."""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
     # Task configuration for DNABERT-2 (max 512 tokens by default, can extrapolate longer)
@@ -397,11 +407,24 @@ def main(argv=None):
     else:
         logging.info("Using full datasets (max_num_samples=None)")
 
-    # Instantiate all tasks from the registry
-    tasks = [
-        cls(root_data_dir_path=root_data_dir_path, task_config=task_config)
+    # Select tasks from the registry; each one is instantiated just before it runs so that
+    # only one dataset is held in RAM at a time.
+    selected_tasks = [
+        (name, cls)
         for name, cls in TASK_REGISTRY.items()
         if (args.tasks is None or name in args.tasks) and name not in args.exclude_tasks
+    ]
+    if args.shard_world > 1:
+        not_shardable = [n for n, cls in selected_tasks if not issubclass(cls, BaseGFMZeroShotTask)]
+        if not_shardable:
+            raise ValueError(
+                f"Task(s) {not_shardable} are not zero-shot tasks and cannot be sharded; "
+                "run them with --shard_world 1."
+            )
+    # Zero-shot tasks first (stable sort keeps registry order within each group) so the
+    # shared model is built once instead of being rebuilt after every fine-tuning task.
+    selected_task_classes = [
+        cls for _, cls in sorted(selected_tasks, key=lambda item: not issubclass(item[1], BaseGFMZeroShotTask))
     ]
 
     # Training parameters for fine-tuning tasks
@@ -415,7 +438,7 @@ def main(argv=None):
         "num_workers": 0,
     }
 
-    logging.info(f"********* Number of tasks: {len(tasks)} *********")
+    logging.info(f"********* Number of tasks: {len(selected_task_classes)} *********")
     logging.info(f"Model: {args.model}")
     logging.info(
         f"Training mode: {'Linear Probing' if training_params['only_proj_layer'] else 'Full Fine-tuning'}"
@@ -424,9 +447,15 @@ def main(argv=None):
 
     benchmark_start = time.perf_counter()
 
+    # Zero-shot tasks never mutate the model, so they share one instance (built lazily).
+    # Fine-tuning tasks train in place, and the projection layer's init depends on the RNG
+    # state left by model construction, so each of those gets a fresh model.
+    shared_model = None
+
     # Run each task
-    for task in tasks:
+    for task_cls in selected_task_classes:
         task_start = time.perf_counter()
+        task = task_cls(root_data_dir_path=root_data_dir_path, task_config=task_config)
         task_name = task.get_task_name()
         logging.info(f"{'='*50}")
         logging.info(f"Running task: {task_name}")
@@ -435,22 +464,21 @@ def main(argv=None):
         # Get task attributes
         task_attrs = task.get_task_attributes()
         has_finetuning_data = task_attrs.get("has_finetuning_data", False)
-        if args.shard_world > 1 and (has_finetuning_data or not isinstance(task, BaseGFMZeroShotTask)):
+        if args.shard_world > 1 and has_finetuning_data:
             raise ValueError(
-                f"Task '{task_name}' is not a zero-shot task and cannot be sharded; "
+                f"Task '{task_name}' has fine-tuning data and cannot be sharded; "
                 "run it with --shard_world 1."
             )
 
         # Re-seed before each task for deterministic model/projection initialization
         set_seed(seed)
 
-        # Reinitialize model for each task to start fresh
-        model = ModelClass(device=device, max_length=max_length, **model_init_kwargs)
-        if checkpoint_path:
-            logging.info(f"Loading checkpoint: {checkpoint_path}")
-            model.load_checkpoint(checkpoint_path)
-
+        finetuner = train_loader = train_dataset = None
         if has_finetuning_data:
+            # Drop the shared model first so two large models never sit on the GPU together.
+            shared_model = None
+            release_model()
+            model = build_model()
             hidden_dim = model.get_hidden_dim()
             task_type = task_attrs["task_type"]
             if task_type != "classification":
@@ -503,7 +531,9 @@ def main(argv=None):
         else:
             # For zero-shot tasks, use model directly
             logging.info("Zero-shot task detected. Skipping fine-tuning.")
-            test_model = model
+            if shared_model is None:
+                shared_model = build_model()
+            model = test_model = shared_model
 
         # Evaluate on test set
         logging.info("Evaluating...")
@@ -525,6 +555,11 @@ def main(argv=None):
             report.add_scores(task_name, report_algo_name, scores)
             report.save_csv()
             logging.info(f"Saved progress to: {csv_path}")
+
+        # Release this task's data (and its fine-tuned model) before the next task is built.
+        test_model = model = finetuner = train_loader = train_dataset = task = None
+        if has_finetuning_data:
+            release_model()
 
         task_elapsed = time.perf_counter() - task_start
         logging.info(
