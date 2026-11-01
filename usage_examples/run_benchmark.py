@@ -176,6 +176,14 @@ MODEL_REGISTRY = {
         "max_length": 512,
         "model_kwargs": {"tokenizer_kind": "nucleotide"},
     },
+    "DNABERT2Small_Comparison": {
+        # Same architecture, tokenizers from `train-opengenome2-mlm --tokenizer-kind comparison`
+        # (ham-og2-comparison-tokenizer-v1 artifacts: H2-F, H2-Z, HK-F, HK-Z, PAIR).
+        "module": "usage_examples.sanity_models.dnabert2_small_model",
+        "class": "DNABERT2SmallModel",
+        "max_length": 128,
+        "model_kwargs": {"tokenizer_kind": "comparison"},
+    },
 }
 
 
@@ -215,6 +223,14 @@ def parse_args(argv=None):
         default=None,
         help="Tokenizer artifact for DNABERT2Small_* models. By default it is located from the "
              "checkpoint's run.json and verified against the checksum the checkpoint recorded."
+    )
+    parser.add_argument(
+        "--pooling",
+        type=str,
+        default=None,
+        choices=["mean", "cls"],
+        help="Sequence embedding for DNABERT2Small_* models: mean of the content tokens (default) "
+             "or the CLS token."
     )
     parser.add_argument(
         "--linear_prob",
@@ -386,7 +402,11 @@ def main(argv=None):
         if MODEL_REGISTRY[args.model]["class"] != "DNABERT2SmallModel":
             raise ValueError("--tokenizer_path is only supported for DNABERT2Small_* models")
         model_init_kwargs["tokenizer_path"] = args.tokenizer_path
-    
+    if args.pooling:
+        if MODEL_REGISTRY[args.model]["class"] != "DNABERT2SmallModel":
+            raise ValueError("--pooling is only supported for DNABERT2Small_* models")
+        model_init_kwargs["pooling"] = args.pooling
+
     logging.info(f"Model: {args.model}, Max sequence length: {max_length}")
     
     # Initialize model (will be reinitialized per task)

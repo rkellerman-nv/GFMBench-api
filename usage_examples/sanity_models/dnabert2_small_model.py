@@ -56,7 +56,7 @@ _ENCODE_CACHE_MAX_CHARS = 200_000_000
 # bounds the [chunk, length, vocabulary] logits tensor.
 _MASKED_LOGPROB_TOKEN_BUDGET = 16_384
 
-TokenizerKind = Literal["hamiltonian", "bpe", "nucleotide"]
+TokenizerKind = Literal["hamiltonian", "bpe", "nucleotide", "comparison"]
 
 # Last-resort tokenizer artifact locations, relative to the repo root inferred from a
 # checkpoint path (checkpoints live at <repo_root>/runs/<run>/checkpoint-*.pt per
@@ -87,6 +87,7 @@ class DNABERT2SmallModel(nn.Module):
         tokenizer_path: str = "",
         max_length: int = 128,
         pretrained: bool = True,
+        pooling: Literal["mean", "cls"] = "mean",
     ):
         """
         Args:
@@ -96,12 +97,17 @@ class DNABERT2SmallModel(nn.Module):
                 if omitted, it is inferred from the checkpoint path on load_checkpoint()
             max_length: maximum sequence length including CLS/SEP; sizes the position table,
                 so it must equal the checkpoint's context length (128, or 512 for nucleotide)
+            pooling: sequence embedding: 'mean' of the DNA-content token states, or the 'cls'
+                token state (position 0)
             pretrained: unused placeholder for registry symmetry with other wrappers;
                 weights are always randomly initialized here and loaded via load_checkpoint
         """
         super().__init__()
         self.device = device
+        if pooling not in ("mean", "cls"):
+            raise ValueError(f"pooling must be 'mean' or 'cls', got {pooling!r}")
         self.tokenizer_kind = tokenizer_kind
+        self.pooling = pooling
         self.encode = None
         self._encode_cache: "OrderedDict[str, tuple]" = OrderedDict()
         self._encode_cache_chars = 0
@@ -281,10 +287,15 @@ class DNABERT2SmallModel(nn.Module):
         weights = (~special).unsqueeze(-1).to(hidden_states.dtype)
         return (hidden_states * weights).sum(1) / weights.sum(1).clamp_min(1.0)
 
+    def _pool(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        if self.pooling == "cls":
+            return hidden_states[:, 0, :]
+        return self._mean_pool_content(hidden_states, input_ids)
+
     def _sequence_to_representative(self, sequences):
         encoded = self.tokenize(sequences)
         outputs = self.model(**encoded)
-        return self._mean_pool_content(outputs.last_hidden_state, encoded["input_ids"])
+        return self._pool(outputs.last_hidden_state, encoded["input_ids"])
 
     def infer_sequence_to_sequence(self, sequences, conditional_input=None):
         encoded = self.tokenize(sequences)
@@ -293,7 +304,7 @@ class DNABERT2SmallModel(nn.Module):
             outputs = self.model(**encoded)
         hidden_states = outputs.last_hidden_state
 
-        sequence_representative = self._mean_pool_content(hidden_states, encoded["input_ids"])
+        sequence_representative = self._pool(hidden_states, encoded["input_ids"])
         hidden_states_seq = hidden_states[:, 1:-1, :]
 
         return (

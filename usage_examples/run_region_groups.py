@@ -64,7 +64,7 @@ PREFIX_TO_GROUP = [
 
 def settings_key(args) -> str:
     """What a job's results depend on; a job counts as done only if it ran with the same settings."""
-    return f"groups={args.groups};seed={args.seed};checkpoint={args.checkpoint_step};sanity={args.sanity}"
+    return f"groups={args.groups};seed={args.seed};checkpoint={args.checkpoint_step}{args.run_suffix};sanity={args.sanity}"
 
 
 def is_done(args, out_dir: Path, arm: str, task: str) -> bool:
@@ -92,6 +92,8 @@ def parse_args():
                         help="region metric groups to run; 'core' is not needed (it is in region_runs2)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--checkpoint_step", default="00300000")
+    parser.add_argument("--run_suffix", default="-ext",
+                        help="suffix of the checkpoint run directories: '-ext' for the 300k runs, '' for the 100k runs")
     parser.add_argument("--threads", type=int, default=4, help="OMP/MKL threads per job")
     parser.add_argument("--sanity", action="store_true", help="100 variants per task (run_benchmark --sanity_check_mode)")
     parser.add_argument("--force", action="store_true", help="rerun jobs that are already done")
@@ -123,7 +125,7 @@ def ensure_token_frequencies(arm: str) -> Path:
 def job_command(args, arm: str, task: str, csv_path: Path):
     model, run, tokenizer, _ = ARMS[arm]
     command = [sys.executable, "usage_examples/run_benchmark.py", "--model", model,
-               "--checkpoint_path", str(HAM_REPO / "runs" / run / f"checkpoint-{args.checkpoint_step}.pt")]
+               "--checkpoint_path", str(HAM_REPO / "runs" / (run.removesuffix("-ext") + args.run_suffix) / f"checkpoint-{args.checkpoint_step}.pt")]
     if tokenizer:
         command += ["--tokenizer_path", str(HAM_REPO / tokenizer)]
     command += ["--linear_prob", "--seed", str(args.seed), "--include_tasks", task,
@@ -232,7 +234,7 @@ def main() -> int:
         for arm in arms:
             ensure_token_frequencies(arm)
     for arm in arms:
-        checkpoint = HAM_REPO / "runs" / ARMS[arm][1] / f"checkpoint-{args.checkpoint_step}.pt"
+        checkpoint = HAM_REPO / "runs" / (ARMS[arm][1].removesuffix("-ext") + args.run_suffix) / f"checkpoint-{args.checkpoint_step}.pt"
         if not checkpoint.is_file():
             raise SystemExit(f"missing checkpoint: {checkpoint}")
 
