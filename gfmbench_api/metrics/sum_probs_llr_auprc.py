@@ -17,6 +17,7 @@
 import numpy as np
 from sklearn.metrics import average_precision_score
 from .base_metric import BaseMetric
+from ._scores import sum_probs_neg_llr
 
 
 class SumProbsLLRAUPRC(BaseMetric):
@@ -46,24 +47,8 @@ class SumProbsLLRAUPRC(BaseMetric):
     
     def _calc_impl(self, variant_probs, reference_probs, gt, epsilon=1e-10):
         """Calculate and store negative LLR scores."""
-        # Verify probabilities are valid (between 0 and 1)
-        assert np.all((variant_probs >= 0) & (variant_probs <= 1)), \
-            "Variant probabilities must be between 0 and 1"
-        assert np.all((reference_probs >= 0) & (reference_probs <= 1)), \
-            "Reference probabilities must be between 0 and 1"
-        
-        # Calculate log-likelihood for all sequences in batch
-        # Sum log probabilities across sequence dimension: [batch_size, seq_len] -> [batch_size]
-        log_likelihood_variant = np.sum(np.log(variant_probs + epsilon), axis=1)
-        log_likelihood_reference = np.sum(np.log(reference_probs + epsilon), axis=1)
-        
-        # Calculate LLR: [batch_size]
-        llr_scores = log_likelihood_variant - log_likelihood_reference
-        
-        # We use -LLR because lower LLR indicates pathogenic variants (label=1)
-        # and sklearn metrics expect higher scores to indicate the positive class
-        neg_llr_scores = -llr_scores
-        
+        neg_llr_scores = sum_probs_neg_llr(variant_probs, reference_probs, epsilon)
+
         # Store only the LLR scores and labels
         self._llr_scores_list.append(neg_llr_scores)
         self._gt_list.append(gt)

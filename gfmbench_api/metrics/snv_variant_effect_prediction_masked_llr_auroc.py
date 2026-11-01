@@ -17,6 +17,7 @@
 import numpy as np
 from sklearn.metrics import roc_auc_score
 from .base_metric import BaseMetric
+from ._scores import masked_token_neg_llr
 
 
 class SNVVariantEffectPredictionMaskedLLRAUROC(BaseMetric):
@@ -57,24 +58,8 @@ class SNVVariantEffectPredictionMaskedLLRAUROC(BaseMetric):
             gt: [batch_size] ground truth labels
             epsilon: small value to avoid log(0)
         """
-        # Verify probabilities are valid (between 0 and 1)
-        assert np.all((variant_probs >= 0) & (variant_probs <= 1)), \
-            "Variant probabilities must be between 0 and 1"
-        assert np.all((reference_probs >= 0) & (reference_probs <= 1)), \
-            "Reference probabilities must be between 0 and 1"
-        
-        # Calculate log-likelihood for variant and reference nucleotides
-        # Shape: [batch_size]
-        log_likelihood_variant = np.log(variant_probs + epsilon)
-        log_likelihood_reference = np.log(reference_probs + epsilon)
-        
-        # Calculate LLR: [batch_size]
-        llr_scores = log_likelihood_variant - log_likelihood_reference
-        
-        # We use -LLR because lower LLR indicates pathogenic variants (label=1)
-        # and sklearn metrics expect higher scores to indicate the positive class
-        neg_llr_scores = -llr_scores
-        
+        neg_llr_scores = masked_token_neg_llr(variant_probs, reference_probs, epsilon)
+
         # Store only the LLR scores and labels
         self._llr_scores_list.append(neg_llr_scores)
         self._gt_list.append(gt)

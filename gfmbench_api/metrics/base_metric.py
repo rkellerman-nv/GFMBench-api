@@ -15,9 +15,49 @@
 
 # This module does not embed third-party data download URLs.
 import logging
+import weakref
 from abc import ABC, abstractmethod
+from functools import wraps
 
 import numpy as np
+
+
+def memoize_last_call(fn):
+    """Cache the most recent result of a score function, keyed on its input arrays.
+
+    The AUROC and AUPRC variants of a metric score each batch from the same arrays; this
+    lets the second one reuse the first one's result instead of recomputing it. Arrays are
+    matched by identity and only weakly referenced, so the cache never keeps a batch alive;
+    this assumes callers do not modify an array in place between calls. Scalars (e.g.
+    epsilon) are matched by equality. Any other argument type is never matched, so the call
+    just recomputes.
+    """
+    last = None
+
+    @wraps(fn)
+    def wrapper(*args):
+        nonlocal last
+        if last is not None:
+            keys, result = last
+            if len(keys) == len(args) and all(
+                (key() is arg) if isinstance(key, weakref.ref) else (type(key) is type(arg) and key == arg)
+                for key, arg in zip(keys, args)
+            ):
+                return result
+        result = fn(*args)
+        keys = []
+        for arg in args:
+            if isinstance(arg, np.ndarray):
+                keys.append(weakref.ref(arg))
+            elif isinstance(arg, (int, float, str, bool, type(None))):
+                keys.append(arg)
+            else:
+                last = None
+                return result
+        last = (tuple(keys), result)
+        return result
+
+    return wrapper
 
 
 class BaseMetric(ABC):

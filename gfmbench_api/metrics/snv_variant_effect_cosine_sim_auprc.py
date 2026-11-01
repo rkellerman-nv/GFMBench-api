@@ -17,6 +17,7 @@
 import numpy as np
 from sklearn.metrics import average_precision_score
 from .base_metric import BaseMetric
+from ._scores import snv_neg_cosine_sim_scores
 
 
 class SNVVariantEffectCosineSimAUPRC(BaseMetric):
@@ -58,51 +59,13 @@ class SNVVariantEffectCosineSimAUPRC(BaseMetric):
             reference_snv_indices: [batch_size] array of SNV positions in reference sequences
             gt: [batch_size] ground truth labels
         """
-        batch_size = variant_embeddings.shape[0]
-        hidden_dim = variant_embeddings.shape[2]
-        
-        # Initialize arrays for extracted embeddings
-        variant_snv_emb = np.zeros((batch_size, hidden_dim))
-        reference_snv_emb = np.zeros((batch_size, hidden_dim))
-        valid_mask = np.ones(batch_size, dtype=bool)
-        
-        # Extract embeddings at the specific SNV position for each sequence
-        for i in range(batch_size):
-            var_idx = variant_snv_indices[i]
-            ref_idx = reference_snv_indices[i]
-            
-            # Check if indices are valid and within bounds
-            if (var_idx is None or var_idx < 0 or var_idx >= variant_embeddings.shape[1] or
-                ref_idx is None or ref_idx < 0 or ref_idx >= reference_embeddings.shape[1]):
-                valid_mask[i] = False
-                continue
-            
-            # Extract embeddings at SNV position
-            variant_snv_emb[i] = variant_embeddings[i, var_idx, :]
-            reference_snv_emb[i] = reference_embeddings[i, ref_idx, :]
-        
-        # If no valid samples, return
-        if not np.any(valid_mask):
+        neg_cosine_sim, valid_mask = snv_neg_cosine_sim_scores(
+            variant_embeddings, reference_embeddings, variant_snv_indices, reference_snv_indices
+        )
+        if neg_cosine_sim is None:
             return
-        
-        # Filter to only valid samples
-        variant_snv_emb = variant_snv_emb[valid_mask]
-        reference_snv_emb = reference_snv_emb[valid_mask]
         gt = gt[valid_mask]
-        
-        # Normalize embeddings to unit vectors for cosine similarity
-        variant_snv_norm = variant_snv_emb / (np.linalg.norm(variant_snv_emb, axis=1, keepdims=True) + 1e-10)
-        reference_snv_norm = reference_snv_emb / (np.linalg.norm(reference_snv_emb, axis=1, keepdims=True) + 1e-10)
-        
-        # Compute cosine similarity at SNV position
-        # Cosine similarity = dot product of normalized vectors
-        cosine_sim = np.sum(variant_snv_norm * reference_snv_norm, axis=1)  # [batch_size]
-        
-        # Lower cosine similarity (less similar) indicates pathogenic variants (label=1)
-        # So we use negative cosine similarity as the prediction score
-        # This way, higher scores indicate higher probability of being pathogenic
-        neg_cosine_sim = -cosine_sim
-        
+
         # Store only the cosine similarity scores and labels
         self._cosine_sim_scores_list.append(neg_cosine_sim)
         self._gt_list.append(gt)

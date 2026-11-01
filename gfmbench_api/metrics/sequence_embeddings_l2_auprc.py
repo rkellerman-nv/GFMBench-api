@@ -17,6 +17,7 @@
 import numpy as np
 from sklearn.metrics import average_precision_score
 from .base_metric import BaseMetric
+from ._scores import l2_distance_scores
 
 
 class SequenceEmbeddingsL2AUPRC(BaseMetric):
@@ -49,7 +50,7 @@ class SequenceEmbeddingsL2AUPRC(BaseMetric):
         """Calculate and store L2 distance scores."""
         # Compute L2 (Euclidean) distance between variant and reference embeddings
         # [batch_size, hidden_dim] -> [batch_size]
-        l2_distance = np.linalg.norm(variant_repr - reference_repr, axis=1)
+        l2_distance = l2_distance_scores(variant_repr, reference_repr)
         
         # Higher L2 distance (more different) indicates pathogenic variants (label=1)
         # So we use L2 distance directly as the prediction score
