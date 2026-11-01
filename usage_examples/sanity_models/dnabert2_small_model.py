@@ -1,0 +1,580 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""DNABERT2-small (~8M param) adapter for GFMBench, covering the Hamiltonian, BPE and
+single-nucleotide tokenizer flavors trained in the ham-dna-tokenizer repo.
+
+Requires the ``ham-dna-tokenizer`` package (and its ``model``/``dnabert2-style``
+extras) to be importable; it supplies the model architecture (``DNABERT2SmallForMaskedLM``)
+and both tokenizer loaders behind a shared no-special-token encoding contract.
+"""
+
+import hashlib
+import json
+from collections import OrderedDict
+from pathlib import Path
+from typing import List, Literal, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+from gfmbench_api.utils.token_diff import (
+    changed_base_interval,
+    clipped_common_suffix_starts,
+    clipped_divergent_spans,
+    padded_token_base_offsets,
+    padded_token_ids,
+    tokens_covering_bases,
+)
+from ham_dna_tokenizer.dnabert2_model import DNABERT2SmallConfig, DNABERT2SmallForMaskedLM
+from ham_dna_tokenizer.mlm_training import load_sequence_encoder
+
+_CLS_ID = 1
+_SEP_ID = 2
+_PAD_ID = 3
+_MASK_ID = 4
+
+# Bounds on memoized encodings (LRU eviction); the character budget keeps RAM bounded even
+# when sequences are very long.
+_ENCODE_CACHE_MAX_ENTRIES = 500_000
+_ENCODE_CACHE_MAX_CHARS = 200_000_000
+
+# Masked-token log-probabilities are computed in chunks of about this many token positions, which
+# bounds the [chunk, length, vocabulary] logits tensor.
+_MASKED_LOGPROB_TOKEN_BUDGET = 16_384
+
+TokenizerKind = Literal["hamiltonian", "bpe", "nucleotide", "comparison"]
+
+# Last-resort tokenizer artifact locations, relative to the repo root inferred from a
+# checkpoint path (checkpoints live at <repo_root>/runs/<run>/checkpoint-*.pt per
+# the ham-dna-tokenizer README's training pipeline). Used only when neither tokenizer_path
+# nor the run's own record (run.json / the checkpoint's tokenizer checksum) identifies the
+# tokenizer; these defaults are NOT correct for every run of a given flavor.
+_DEFAULT_TOKENIZER_ARTIFACT_RELATIVE_TO_REPO_ROOT = {
+    "hamiltonian": Path("artifacts") / "ham-4091.json",
+    "bpe": Path("artifacts") / "bpe-4096" / "tokenizer.json",
+}
+
+
+class DNABERT2SmallModel(nn.Module):
+    """ham-dna-tokenizer's ~8M-parameter DNABERT2-style MLM encoder for GFMBench.
+
+    Instantiate once per tokenizer flavor by passing ``tokenizer_kind`` ("hamiltonian",
+    "bpe" or "nucleotide"; the latter has no tokenizer file and needs ``max_length=512``
+    to match its training context). ``tokenizer_path`` (a Hamiltonian vocabulary JSON or a BPE
+    ``tokenizer.json``, per the ham-dna-tokenizer README's training pipeline) can be
+    given explicitly, or left unset and inferred from the checkpoint path passed to
+    ``load_checkpoint`` via the repo's conventional ``artifacts/`` layout.
+    """
+
+    def __init__(
+        self,
+        device="cpu",
+        tokenizer_kind: TokenizerKind = "hamiltonian",
+        tokenizer_path: str = "",
+        max_length: int = 128,
+        pretrained: bool = True,
+        pooling: Literal["mean", "cls"] = "mean",
+    ):
+        """
+        Args:
+            device: torch device ('cpu' or 'cuda')
+            tokenizer_kind: 'hamiltonian', 'bpe' or 'nucleotide', selecting the tokenizer flavor
+            tokenizer_path: path to the trained tokenizer artifact for that flavor;
+                if omitted, it is inferred from the checkpoint path on load_checkpoint()
+            max_length: maximum sequence length including CLS/SEP; sizes the position table,
+                so it must equal the checkpoint's context length (128, or 512 for nucleotide)
+            pooling: sequence embedding: 'mean' of the DNA-content token states, or the 'cls'
+                token state (position 0)
+            pretrained: unused placeholder for registry symmetry with other wrappers;
+                weights are always randomly initialized here and loaded via load_checkpoint
+        """
+        super().__init__()
+        self.device = device
+        if pooling not in ("mean", "cls"):
+            raise ValueError(f"pooling must be 'mean' or 'cls', got {pooling!r}")
+        self.tokenizer_kind = tokenizer_kind
+        self.pooling = pooling
+        self.encode = None
+        self._encode_cache: "OrderedDict[str, tuple]" = OrderedDict()
+        self._encode_cache_chars = 0
+        self._nucleotide_token_ids: Optional[dict] = None
+        self.config = DNABERT2SmallConfig(max_position_embeddings=max_length)
+        self.max_length = max_length
+
+        if tokenizer_kind == "nucleotide":
+            if tokenizer_path:
+                raise ValueError("the nucleotide flavor has no tokenizer file")
+            self.encode = load_sequence_encoder(tokenizer_kind, None)
+        elif tokenizer_path:
+            self._load_tokenizer(tokenizer_path)
+
+        self.model = DNABERT2SmallForMaskedLM(self.config)
+        self.add_module("model", self.model)
+        self.model.to(device)
+
+        self.hidden_dim = self.config.hidden_size
+        self.mlm_head_loaded = True
+
+        print(
+            f"DNABERT2-small ({tokenizer_kind}) loaded. Hidden dim: {self.hidden_dim}, "
+            f"max_length: {self.max_length}, params: {self.model.num_parameters():,}"
+        )
+
+    def _load_tokenizer(self, tokenizer_path) -> None:
+        tokenizer_path = Path(tokenizer_path)
+        print(f"Loading DNABERT2-small ({self.tokenizer_kind}) tokenizer from: {tokenizer_path}")
+        self.tokenizer_path = tokenizer_path
+        self.encode = load_sequence_encoder(self.tokenizer_kind, tokenizer_path)
+        self._encode_cache.clear()
+        self._encode_cache_chars = 0
+        self._nucleotide_token_ids = None
+
+    def _infer_tokenizer_path(self, checkpoint_path, expected_sha256: Optional[str] = None) -> Path:
+        """Resolve the tokenizer artifact the checkpoint was trained with.
+
+        Order of evidence: the run's ``run.json`` next to the checkpoint (recorded path, then
+        the same ``artifacts/...`` tail under this repo root, then the file name), each
+        candidate accepted only if its sha256 equals ``expected_sha256`` (taken from the
+        checkpoint, else ``run.json``). With no record at all, falls back to the flavor's
+        default artifact and warns, because a default can silently be the wrong vocabulary.
+        """
+        checkpoint_path = Path(checkpoint_path).resolve()
+        # checkpoint file -> run dir -> runs dir -> repo root
+        repo_root = checkpoint_path.parent.parent.parent
+        run = self._read_run_json(checkpoint_path)
+        if run is not None and run.get("tokenizer_kind") not in (None, self.tokenizer_kind):
+            raise ValueError(
+                f"{checkpoint_path.parent / 'run.json'} records tokenizer_kind="
+                f"{run['tokenizer_kind']!r} but this model was built with {self.tokenizer_kind!r}"
+            )
+        expected = expected_sha256 or (run or {}).get("tokenizer_sha256")
+        recorded = (run or {}).get("tokenizer_path")
+        if recorded:
+            recorded = Path(recorded)
+            candidates = [recorded]
+            if "artifacts" in recorded.parts:
+                last = max(i for i, part in enumerate(recorded.parts) if part == "artifacts")
+                candidates.append(repo_root / "artifacts" / Path(*recorded.parts[last + 1 :]))
+            candidates.append(repo_root / "artifacts" / recorded.name)
+            for candidate in candidates:
+                if candidate.is_file() and (not expected or self._sha256(candidate) == expected):
+                    return candidate
+            raise FileNotFoundError(
+                f"no tokenizer matching sha256 {expected} found (recorded path {recorded}, "
+                f"searched under {repo_root / 'artifacts'}); pass --tokenizer_path explicitly"
+            )
+        default = repo_root / _DEFAULT_TOKENIZER_ARTIFACT_RELATIVE_TO_REPO_ROOT[self.tokenizer_kind]
+        print(
+            f"WARNING: no run.json next to {checkpoint_path}; falling back to the default "
+            f"{self.tokenizer_kind} tokenizer {default}. This is wrong for any run trained "
+            "with a different vocabulary; pass --tokenizer_path to be sure."
+        )
+        return default
+
+    @staticmethod
+    def _read_run_json(checkpoint_path: Path) -> Optional[dict]:
+        run_path = Path(checkpoint_path).parent / "run.json"
+        return json.loads(run_path.read_text()) if run_path.is_file() else None
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def eval(self):
+        self.model.eval()
+        return self
+
+    def train(self, mode=True):
+        self.model.train(mode)
+        return self
+
+    def to(self, device):
+        self.model.to(device)
+        self.device = device
+        return self
+
+    def get_hidden_dim(self):
+        return self.hidden_dim
+
+    def parameters(self, recurse: bool = True):
+        return self.model.parameters(recurse=recurse)
+
+    def named_parameters(self, prefix: str = "", recurse: bool = True):
+        for name, param in self.model.named_parameters(prefix="", recurse=recurse):
+            yield name, param
+
+    def state_dict(self, prefix: str = "", keep_vars: bool = False):
+        return self.model.state_dict(prefix=prefix, keep_vars=keep_vars)
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        return self.model.load_state_dict(state_dict, strict=strict)
+
+    def _encode_full(self, sequence: str) -> Tuple[Sequence[int], Sequence[int]]:
+        """Tokenize DNA content only, without truncation: (token_ids, bases_per_token)."""
+        if self.encode is None:
+            raise RuntimeError(
+                "no tokenizer loaded; pass tokenizer_path to the constructor or call "
+                "load_checkpoint() first"
+            )
+        cached = self._encode_cache.get(sequence)
+        if cached is not None:
+            self._encode_cache.move_to_end(sequence)
+            return cached
+        key = sequence
+        if self.tokenizer_kind == "nucleotide":
+            sequence = sequence.upper()
+        token_ids, token_bases = self.encode(sequence)
+        # Tuples: cached values are shared between callers and must not be mutated.
+        result = (tuple(token_ids), tuple(token_bases))
+        # Tokenizing is the benchmark's CPU bottleneck and each sequence is otherwise encoded
+        # several times per batch (embeddings, SNV position mapping, masked LLR, epochs).
+        self._encode_cache[key] = result
+        self._encode_cache_chars += len(key)
+        while self._encode_cache and (
+            len(self._encode_cache) > _ENCODE_CACHE_MAX_ENTRIES
+            or self._encode_cache_chars > _ENCODE_CACHE_MAX_CHARS
+        ):
+            old_key, _ = self._encode_cache.popitem(last=False)
+            self._encode_cache_chars -= len(old_key)
+        return result
+
+    def _encode_content(self, sequence: str) -> Tuple[Sequence[int], Sequence[int]]:
+        """Tokenize DNA content only, truncated to fit CLS/SEP within max_length."""
+        content_length = self.max_length - 2
+        token_ids, token_bases = self._encode_full(sequence)
+        return token_ids[:content_length], token_bases[:content_length]
+
+    def tokenize(self, sequences: List[str]):
+        return self._batch_from_content_ids([self._encode_content(sequence)[0] for sequence in sequences])
+
+    def _batch_from_content_ids(self, content_ids_per_sequence):
+        """Model input from DNA-content token IDs: CLS/SEP added, right-padded."""
+        batch_ids = [[_CLS_ID, *content_ids, _SEP_ID] for content_ids in content_ids_per_sequence]
+        width = max(len(ids) for ids in batch_ids)
+        input_ids = torch.full((len(batch_ids), width), _PAD_ID, dtype=torch.long)
+        for row, ids in enumerate(batch_ids):
+            input_ids[row, : len(ids)] = torch.tensor(ids, dtype=torch.long)
+        input_ids = input_ids.to(self.device)
+        attention_mask = input_ids.ne(_PAD_ID)
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    @staticmethod
+    def _mean_pool_content(hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        """Mean of the DNA-content token states, excluding CLS, SEP and padding.
+
+        The model is MLM-trained without a CLS objective, so position 0 is not a meaningful
+        sequence summary.
+        """
+        special = (input_ids == _CLS_ID) | (input_ids == _SEP_ID) | (input_ids == _PAD_ID)
+        weights = (~special).unsqueeze(-1).to(hidden_states.dtype)
+        return (hidden_states * weights).sum(1) / weights.sum(1).clamp_min(1.0)
+
+    def _pool(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        if self.pooling == "cls":
+            return hidden_states[:, 0, :]
+        return self._mean_pool_content(hidden_states, input_ids)
+
+    def _sequence_to_representative(self, sequences):
+        encoded = self.tokenize(sequences)
+        outputs = self.model(**encoded)
+        return self._pool(outputs.last_hidden_state, encoded["input_ids"])
+
+    def infer_sequence_to_sequence(self, sequences, conditional_input=None):
+        encoded = self.tokenize(sequences)
+
+        with torch.no_grad():
+            outputs = self.model(**encoded)
+        hidden_states = outputs.last_hidden_state
+
+        sequence_representative = self._pool(hidden_states, encoded["input_ids"])
+        hidden_states_seq = hidden_states[:, 1:-1, :]
+
+        return (
+            None,
+            hidden_states_seq.detach().cpu().numpy(),
+            sequence_representative.detach().cpu().numpy(),
+        )
+
+    def _get_nucleotide_token_ids(self) -> dict:
+        if self._nucleotide_token_ids is None:
+            ids = {}
+            for nuc in ["A", "T", "C", "G"]:
+                tokens, _ = self.encode(nuc)
+                if len(tokens) == 1:
+                    ids[nuc] = tokens[0]
+            self._nucleotide_token_ids = ids
+        return self._nucleotide_token_ids
+
+    def sequence_pos_to_prob_pos(self, sequences, pos):
+        batch_size = len(sequences)
+        output_positions = np.zeros(batch_size, dtype=np.int32)
+
+        for i, seq in enumerate(sequences):
+            _, token_bases = self._encode_content(seq)
+            cursor = 0
+            token_idx = -1
+            for idx, length in enumerate(token_bases):
+                if cursor <= pos < cursor + length:
+                    token_idx = idx
+                    break
+                cursor += length
+            output_positions[i] = token_idx
+
+        return output_positions
+
+    def get_affected_token_spans(self, variant_sequences, reference_sequences, context_tokens=0):
+        """Token spans (var_start, var_end, ref_start, ref_end) affected by each variant.
+
+        Works for all tokenizer flavors: the variant and reference tokenizations are diffed
+        before truncation (so BPE/Hamiltonian re-segmentation does not defeat suffix
+        matching) and the spans are clipped to the content tokens the model embeds, i.e.
+        indices into infer_sequence_to_sequence's hidden states (CLS/SEP removed). Pairs
+        whose affected tokens are all truncated away, or that tokenize identically, are -1.
+        """
+        content_length = self.max_length - 2
+        spans = np.full((len(variant_sequences), 4), -1, dtype=np.int32)
+        for i, (var_seq, ref_seq) in enumerate(zip(variant_sequences, reference_sequences)):
+            var_ids, _ = self._encode_full(var_seq)
+            ref_ids, _ = self._encode_full(ref_seq)
+            spans[i] = clipped_divergent_spans(ref_ids, var_ids, context_tokens, content_length)
+        return spans
+
+    def get_affected_suffix_starts(self, variant_sequences, reference_sequences):
+        """Token index where the unchanged common suffix starts on each side (see BaseGFMModel)."""
+        content_length = self.max_length - 2
+        starts = np.full((len(variant_sequences), 2), -1, dtype=np.int32)
+        for i, (var_seq, ref_seq) in enumerate(zip(variant_sequences, reference_sequences)):
+            var_ids, _ = self._encode_full(var_seq)
+            ref_ids, _ = self._encode_full(ref_seq)
+            starts[i] = clipped_common_suffix_starts(ref_ids, var_ids, content_length)
+        return starts
+
+    def get_token_base_offsets(self, sequences):
+        """Base index where each embedded content token starts (see BaseGFMModel).
+
+        Uses the same truncated tokenization as infer_sequence_to_sequence, so entry j indexes
+        the same token as column j of its hidden states.
+        """
+        return padded_token_base_offsets([self._encode_content(seq)[1] for seq in sequences])
+
+    def get_token_ids(self, sequences):
+        """Token IDs of the embedded content tokens, padded with -1 (see BaseGFMModel)."""
+        return padded_token_ids([self._encode_content(seq)[0] for seq in sequences])
+
+    def _forced_segmentation(self, variant_sequence, reference_sequence):
+        """
+        The variant tokenized with the reference's boundaries outside the substituted token(s).
+
+        The substituted bases are cut out at the boundaries of the reference tokens they touch and
+        tokenized on their own. Returns (forced_ids, first, n_new, last, n_ref) where the variant's
+        tokens [first, first + n_new) replace the reference's tokens [first, last), or None for a
+        pair that is not an equal-length substitution.
+        """
+        interval = changed_base_interval(reference_sequence, variant_sequence)
+        if interval is None:
+            return None
+        ref_ids, ref_bases = self._encode_full(reference_sequence)
+        bounds = np.concatenate([[0], np.cumsum(ref_bases, dtype=np.int64)])
+        first, last = tokens_covering_bases(bounds, *interval)
+        if first < 0:
+            return None
+        low, high = int(bounds[first]), int(bounds[last])
+        new_ids, new_bases = self._encode_full(variant_sequence[low:high])
+        if len(new_ids) == 0 or sum(new_bases) != high - low:
+            return None
+        return (*ref_ids[:first], *new_ids, *ref_ids[last:]), first, len(new_ids), last, len(ref_ids)
+
+    def infer_forced_segmentation_embeddings(self, variant_sequences, reference_sequences):
+        """Embeddings of the variants tokenized with the references' boundaries (see BaseGFMModel)."""
+        content_length = self.max_length - 2
+        content = []
+        for var_seq, ref_seq in zip(variant_sequences, reference_sequences):
+            forced = self._forced_segmentation(var_seq, ref_seq)
+            ids = forced[0] if forced is not None else self._encode_full(var_seq)[0]
+            content.append(ids[:content_length])
+        encoded = self._batch_from_content_ids(content)
+        with torch.no_grad():
+            hidden_states = self.model(**encoded).last_hidden_state
+        return hidden_states[:, 1:-1, :].detach().cpu().numpy()
+
+    def get_forced_segmentation_spans(self, variant_sequences, reference_sequences, context_tokens=0):
+        """Spans of the re-tokenized substituted bases in the forced variant (see BaseGFMModel)."""
+        content_length = self.max_length - 2
+        spans = np.full((len(variant_sequences), 4), -1, dtype=np.int32)
+        for i, (var_seq, ref_seq) in enumerate(zip(variant_sequences, reference_sequences)):
+            forced = self._forced_segmentation(var_seq, ref_seq)
+            if forced is None:
+                continue
+            ids, first, n_new, last, n_ref = forced
+            if first >= content_length:
+                continue
+            spans[i] = (
+                max(0, first - context_tokens),
+                min(len(ids), content_length, first + n_new + context_tokens),
+                max(0, first - context_tokens),
+                min(n_ref, content_length, last + context_tokens),
+            )
+        return spans
+
+    def infer_masked_token_logprobs(self, sequences, token_positions):
+        """log p(true token | sequence with only that token masked) per position (see BaseGFMModel)."""
+        positions = np.asarray(token_positions)
+        result = np.full(positions.shape, np.nan, dtype=np.float32)
+        encoded = self.tokenize(sequences)
+        input_ids, attention_mask = encoded["input_ids"], encoded["attention_mask"]
+        # CLS and SEP are the only special tokens in a row besides padding
+        num_content = (attention_mask.sum(dim=1) - 2).cpu().numpy()
+        rows, slots = np.nonzero((positions >= 0) & (positions < num_content[:, None]))
+        if rows.size == 0:
+            return result
+        columns = positions[rows, slots] + 1  # past CLS
+        chunk = max(1, _MASKED_LOGPROB_TOKEN_BUDGET // input_ids.shape[1])
+        with torch.no_grad():
+            for start in range(0, rows.size, chunk):
+                sel = slice(start, start + chunk)
+                row_index = torch.as_tensor(rows[sel], device=input_ids.device)
+                column_index = torch.as_tensor(columns[sel], device=input_ids.device)
+                batch = input_ids[row_index].clone()
+                arange = torch.arange(batch.shape[0], device=batch.device)
+                true_ids = batch[arange, column_index].clone()
+                batch[arange, column_index] = _MASK_ID
+                logits = self.model(input_ids=batch, attention_mask=attention_mask[row_index]).logits
+                log_probs = torch.log_softmax(logits[arange, column_index].float(), dim=-1)
+                result[rows[sel], slots[sel]] = log_probs[arange, true_ids].cpu().numpy()
+        return result
+
+    def infer_sequence_to_labels_probs(self, sequences, conditional_input=None):
+        return None
+
+    def infer_variant_ref_sequences_to_labels_probs(
+        self, variant_sequences, ref_sequences, conditional_input=None
+    ):
+        return None
+
+    def infer_masked_sequence_to_token_probs(
+        self,
+        sequences: List[str],
+        variant_pos: int,
+        variant_letters: List[str],
+        reference_letters: List[str],
+        conditional_input=None,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if not self.mlm_head_loaded:
+            return None, None
+
+        batch_size = len(sequences)
+        encoded = self.tokenize(sequences)
+        input_ids = encoded["input_ids"]
+
+        mask_token_positions = np.full(batch_size, -1, dtype=np.int64)
+        for i, seq in enumerate(sequences):
+            _, token_bases = self._encode_content(seq)
+            cursor = 0
+            token_idx = -1
+            for idx, length in enumerate(token_bases):
+                if cursor <= variant_pos < cursor + length:
+                    token_idx = idx
+                    break
+                cursor += length
+            if token_idx >= 0:
+                # +1 shifts past the CLS token prepended in tokenize().
+                mask_token_positions[i] = token_idx + 1
+                input_ids[i, token_idx + 1] = _MASK_ID
+
+        if (mask_token_positions < 0).any():
+            return None, None
+
+        with torch.no_grad():
+            outputs = self.model(input_ids=input_ids, attention_mask=encoded["attention_mask"])
+            probs = torch.softmax(outputs.logits, dim=-1)
+
+        nucleotide_token_ids = self._get_nucleotide_token_ids()
+        if len(nucleotide_token_ids) < 4:
+            return None, None
+
+        variant_probs_list = []
+        reference_probs_list = []
+        for i in range(batch_size):
+            mask_pos = mask_token_positions[i]
+            var_token_id = nucleotide_token_ids.get(variant_letters[i].upper())
+            ref_token_id = nucleotide_token_ids.get(reference_letters[i].upper())
+            if var_token_id is None or ref_token_id is None:
+                variant_probs_list.append(0.0)
+                reference_probs_list.append(0.0)
+                continue
+            variant_probs_list.append(probs[i, mask_pos, var_token_id].item())
+            reference_probs_list.append(probs[i, mask_pos, ref_token_id].item())
+
+        return (
+            np.array(variant_probs_list, dtype=np.float32),
+            np.array(reference_probs_list, dtype=np.float32),
+        )
+
+    def load_checkpoint(self, checkpoint_path: str):
+        print(f"Loading checkpoint from: {checkpoint_path}")
+        state = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+
+        if self.tokenizer_kind != "nucleotide":
+            expected = state.get("tokenizer_sha256") if isinstance(state, dict) else None
+            if self.encode is None:
+                self._load_tokenizer(self._infer_tokenizer_path(checkpoint_path, expected))
+            expected = expected or (self._read_run_json(Path(checkpoint_path)) or {}).get(
+                "tokenizer_sha256"
+            )
+            if expected:
+                actual = self._sha256(Path(self.tokenizer_path))
+                if actual != expected:
+                    raise ValueError(
+                        f"tokenizer {self.tokenizer_path} (sha256 {actual}) is not the one this "
+                        f"checkpoint was trained with (sha256 {expected}); pass --tokenizer_path"
+                    )
+                print(f"Tokenizer checksum matches the checkpoint's record ({expected[:12]}...)")
+            else:
+                print("WARNING: no tokenizer checksum recorded for this checkpoint; not verified")
+
+        if "model" in state:
+            self.model.load_state_dict(state["model"], strict=False)
+            print("Loaded model weights (including MLM head)")
+        elif "model_state_dict" in state:
+            self.model.load_state_dict(state["model_state_dict"], strict=False)
+            print("Loaded model weights (including MLM head)")
+        else:
+            self.model.load_state_dict(state, strict=False)
+            print("Loaded model weights (direct state_dict)")
+        self.mlm_head_loaded = True
+
+    def save_checkpoint(self, checkpoint_path: str, extra_state: dict = None):
+        import os
+
+        os.makedirs(
+            os.path.dirname(checkpoint_path) if os.path.dirname(checkpoint_path) else ".",
+            exist_ok=True,
+        )
+
+        checkpoint = {"model": self.model.state_dict()}
+        if extra_state:
+            checkpoint.update(extra_state)
+
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Checkpoint saved to: {checkpoint_path}")
+
+    def get_tokenizer(self):
+        return self.encode

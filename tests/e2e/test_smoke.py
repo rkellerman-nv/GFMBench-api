@@ -44,6 +44,13 @@ ZERO_SHOT_COMMON_METRICS = {
     "sequence_embeddings_l2_auprc",
 }
 
+ZERO_SHOT_AFFECTED_REGION_METRICS = {
+    f"affected_region_k{k}_{dist}_{score}"
+    for k in (0, 2)
+    for dist in ("cosinesim", "l2")
+    for score in ("auroc", "auprc")
+} | {"affected_region_length_auroc", "affected_region_mean_tokens"}
+
 ZERO_SHOT_SNV_METRICS = {
     "snv_variant_effect_cosinesim_auroc",
     "snv_variant_effect_cosinesim_auprc",
@@ -78,7 +85,7 @@ def test_e2e_zero_shot_snv(fixtures_root, smoke_task_config, mock_model):
         task_config=smoke_task_config,
     )
     results = task.eval_test_set(mock_model)
-    expected = ZERO_SHOT_COMMON_METRICS | ZERO_SHOT_SNV_METRICS
+    expected = ZERO_SHOT_COMMON_METRICS | ZERO_SHOT_SNV_METRICS | ZERO_SHOT_AFFECTED_REGION_METRICS
     assert set(results.keys()) == expected
     assert all(score is not None for score in results.values())
 
@@ -89,7 +96,7 @@ def test_e2e_zero_shot_indel(fixtures_root, smoke_task_config, mock_model):
         task_config=smoke_task_config,
     )
     results = task.eval_test_set(mock_model)
-    assert set(results.keys()) == ZERO_SHOT_COMMON_METRICS
+    assert set(results.keys()) == ZERO_SHOT_COMMON_METRICS | ZERO_SHOT_AFFECTED_REGION_METRICS
     assert ZERO_SHOT_SNV_METRICS.isdisjoint(results.keys())
     assert all(score is not None for score in results.values())
 

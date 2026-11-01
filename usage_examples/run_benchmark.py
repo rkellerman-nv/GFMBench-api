@@ -75,10 +75,10 @@ TASK_REGISTRY: dict[str, type] = {
     "brca1":                              BRCA1Task,
     "clinvar_indel":                      IndelClinvarTask,
     "loleve_causal_eqtl":                LoleveCausalEqtlTask,
-    "lrb_variant_effect_causal_eqtl":    LRBCausalEqtlTask,
-    "lrb_variant_effect_pathogenic_omim": LrbVariantEffectPathogenicOmimTask,
-    "lrb_regulatory_element_enhancer":   LRBEnhancerTask,
-    "lrb_chromatin_features_histone_marks": LRBHistoneMarksTask,
+#    "lrb_variant_effect_causal_eqtl":    LRBCausalEqtlTask,
+#    "lrb_variant_effect_pathogenic_omim": LrbVariantEffectPathogenicOmimTask,
+#    "lrb_regulatory_element_enhancer":   LRBEnhancerTask,
+#    "lrb_chromatin_features_histone_marks": LRBHistoneMarksTask,
     "bend_variant_effects_disease":       BendVEPDisease,
     "bend_variant_effects_expression":    BendVEPExpression,
     "gue_promoter_all":                   GuePromoterAllTask,
@@ -139,6 +139,44 @@ MODEL_REGISTRY = {
         "class": "IsolatedMockModel",
         "max_length": 128,
     },
+    "DNABERT2Small_Hamiltonian": {
+        # ham-dna-tokenizer's ~8M-param DNABERT2-style encoder, Hamiltonian tokenizer flavor.
+        # Requires --checkpoint_path pointing at a runs/ham/checkpoint-*.pt produced by
+        # `ham-dna-tokenizer train-opengenome2-mlm --tokenizer-kind hamiltonian ...`; the
+        # matching tokenizer artifact is inferred from that checkpoint path's repo layout
+        # (<repo_root>/artifacts/ham-4091.json), so no machine-specific path is hard-coded here.
+        "module": "usage_examples.sanity_models.dnabert2_small_model",
+        "class": "DNABERT2SmallModel",
+        "max_length": 128,
+        "model_kwargs": {"tokenizer_kind": "hamiltonian"},
+    },
+    "DNABERT2Small_BPE": {
+        # Same architecture, DNABERT2-style BPE tokenizer flavor.
+        # Requires --checkpoint_path pointing at a runs/bpe/checkpoint-*.pt produced by
+        # `ham-dna-tokenizer train-opengenome2-mlm --tokenizer-kind bpe ...`; the matching
+        # tokenizer artifact is inferred the same way (<repo_root>/artifacts/bpe-4096/tokenizer.json).
+        "module": "usage_examples.sanity_models.dnabert2_small_model",
+        "class": "DNABERT2SmallModel",
+        "max_length": 128,
+        "model_kwargs": {"tokenizer_kind": "bpe"},
+    },
+    "DNABERT2Small_Nucleotide": {
+        # Same architecture, single-nucleotide tokens (one base per token, no tokenizer file).
+        # Requires --checkpoint_path pointing at a runs/nucleotide/checkpoint-*.pt produced by
+        # `ham-dna-tokenizer train-opengenome2-mlm --tokenizer-kind nucleotide --context-length 512 ...`.
+        "module": "usage_examples.sanity_models.dnabert2_small_model",
+        "class": "DNABERT2SmallModel",
+        "max_length": 512,
+        "model_kwargs": {"tokenizer_kind": "nucleotide"},
+    },
+    "DNABERT2Small_Comparison": {
+        # Same architecture, tokenizers from `train-opengenome2-mlm --tokenizer-kind comparison`
+        # (ham-og2-comparison-tokenizer-v1 artifacts: H2-F, H2-Z, HK-F, HK-Z, PAIR).
+        "module": "usage_examples.sanity_models.dnabert2_small_model",
+        "class": "DNABERT2SmallModel",
+        "max_length": 128,
+        "model_kwargs": {"tokenizer_kind": "comparison"},
+    },
 }
 
 
@@ -171,6 +209,21 @@ def parse_args(argv=None):
         type=str,
         default=None,
         help="Checkpoint to load (set to None to use default HuggingFace weights)"
+    )
+    parser.add_argument(
+        "--tokenizer_path",
+        type=str,
+        default=None,
+        help="Tokenizer artifact for DNABERT2Small_* models. By default it is located from the "
+             "checkpoint's run.json and verified against the checksum the checkpoint recorded."
+    )
+    parser.add_argument(
+        "--pooling",
+        type=str,
+        default=None,
+        choices=["mean", "cls"],
+        help="Sequence embedding for DNABERT2Small_* models: mean of the content tokens (default) "
+             "or the CLS token."
     )
     parser.add_argument(
         "--linear_prob",
@@ -275,7 +328,44 @@ def parse_args(argv=None):
         action="store_true",
         help="Do not overlap next-batch tokenization with GPU inference (for A/B timing).",
     )
+    parser.add_argument(
+        "--include_tasks",
+        nargs="*",
+        default=None,
+        metavar="TASK",
+        help="Run only these task names (default: all registered tasks).",
+    )
+    parser.add_argument(
+        "--shard",
+        type=str,
+        default=None,
+        metavar="I/N",
+        help="Run only shard I (0-based) of N: after include/exclude filtering, tasks are "
+             "dealt round-robin to shards. Use one process (and GPU) per shard, each with "
+             "its own --csv_path; see usage_examples/run_benchmark_sharded.sh.",
+    )
     return parser.parse_args(argv)
+
+
+def select_task_names(include_tasks, exclude_tasks, shard):
+    """Registry task names to run, after include/exclude filtering and sharding."""
+    names = list(TASK_REGISTRY)
+    if include_tasks is not None:
+        unknown = [n for n in include_tasks if n not in TASK_REGISTRY]
+        if unknown:
+            raise ValueError(f"Unknown task(s) in --include_tasks: {unknown}")
+        names = [n for n in names if n in include_tasks]
+    names = [n for n in names if n not in exclude_tasks]
+    if shard is not None:
+        try:
+            index, count = (int(x) for x in shard.split("/"))
+        except ValueError:
+            raise ValueError(f"--shard must look like I/N, got {shard!r}") from None
+        if count < 1 or not 0 <= index < count:
+            raise ValueError(f"--shard {shard}: need 0 <= I < N")
+        # Round-robin by registry order; task cost is unknown here, so shards may be unbalanced.
+        names = names[index::count]
+    return names
 
 
 def set_seed(seed: int):
@@ -297,6 +387,7 @@ def set_seed(seed: int):
         except AttributeError:
             pass
 
+    # Only affects subprocesses: the hash seed of this interpreter is fixed at startup.
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 
@@ -351,8 +442,16 @@ def main(argv=None):
         raise ValueError("Evo2 does not support full fine-tuning. Use --linear_prob for Evo2 benchmarks.")
     ModelClass = get_model_class(args.model)
     max_length = MODEL_REGISTRY[args.model]["max_length"]
-    model_init_kwargs = MODEL_REGISTRY[args.model].get("model_kwargs", {})
-    
+    model_init_kwargs = dict(MODEL_REGISTRY[args.model].get("model_kwargs", {}))
+    if args.tokenizer_path:
+        if MODEL_REGISTRY[args.model]["class"] != "DNABERT2SmallModel":
+            raise ValueError("--tokenizer_path is only supported for DNABERT2Small_* models")
+        model_init_kwargs["tokenizer_path"] = args.tokenizer_path
+    if args.pooling:
+        if MODEL_REGISTRY[args.model]["class"] != "DNABERT2SmallModel":
+            raise ValueError("--pooling is only supported for DNABERT2Small_* models")
+        model_init_kwargs["pooling"] = args.pooling
+
     logging.info(f"Model: {args.model}, Max sequence length: {max_length}")
     
     def build_model():
@@ -407,15 +506,13 @@ def main(argv=None):
     else:
         logging.info("Using full datasets (max_num_samples=None)")
 
-    # Select tasks from the registry; each one is instantiated just before it runs so that
-    # only one dataset is held in RAM at a time.
-    selected_tasks = [
-        (name, cls)
-        for name, cls in TASK_REGISTRY.items()
-        if (args.tasks is None or name in args.tasks) and name not in args.exclude_tasks
-    ]
+    # Tasks are instantiated lazily (one at a time, in the loop below) so only one dataset is
+    # held in RAM at a time, and a shard only builds the datasets of its own tasks.
+    task_names = select_task_names(args.include_tasks, args.exclude_tasks, args.shard)
+    if args.tasks is not None:
+        task_names = [n for n in task_names if n in args.tasks]
     if args.shard_world > 1:
-        not_shardable = [n for n, cls in selected_tasks if not issubclass(cls, BaseGFMZeroShotTask)]
+        not_shardable = [n for n in task_names if not issubclass(TASK_REGISTRY[n], BaseGFMZeroShotTask)]
         if not_shardable:
             raise ValueError(
                 f"Task(s) {not_shardable} are not zero-shot tasks and cannot be sharded; "
@@ -423,9 +520,7 @@ def main(argv=None):
             )
     # Zero-shot tasks first (stable sort keeps registry order within each group) so the
     # shared model is built once instead of being rebuilt after every fine-tuning task.
-    selected_task_classes = [
-        cls for _, cls in sorted(selected_tasks, key=lambda item: not issubclass(item[1], BaseGFMZeroShotTask))
-    ]
+    task_names.sort(key=lambda n: not issubclass(TASK_REGISTRY[n], BaseGFMZeroShotTask))
 
     # Training parameters for fine-tuning tasks
     training_params = {
@@ -438,7 +533,8 @@ def main(argv=None):
         "num_workers": 0,
     }
 
-    logging.info(f"********* Number of tasks: {len(selected_task_classes)} *********")
+    logging.info(f"********* Number of tasks: {len(task_names)} *********")
+    logging.info(f"Tasks: {task_names}")
     logging.info(f"Model: {args.model}")
     logging.info(
         f"Training mode: {'Linear Probing' if training_params['only_proj_layer'] else 'Full Fine-tuning'}"
@@ -453,9 +549,14 @@ def main(argv=None):
     shared_model = None
 
     # Run each task
-    for task_cls in selected_task_classes:
+    for registry_name in task_names:
         task_start = time.perf_counter()
-        task = task_cls(root_data_dir_path=root_data_dir_path, task_config=task_config)
+        # Seed before dataset construction so a task's data does not depend on which
+        # tasks ran before it (needed for sharded runs to match a serial run).
+        set_seed(seed)
+        task = TASK_REGISTRY[registry_name](
+            root_data_dir_path=root_data_dir_path, task_config=task_config
+        )
         task_name = task.get_task_name()
         logging.info(f"{'='*50}")
         logging.info(f"Running task: {task_name}")
