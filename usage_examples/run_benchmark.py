@@ -69,6 +69,8 @@ from gfmbench_api.tasks.concrete.brca1_task import BRCA1Task
 from gfmbench_api.tasks.concrete.clinvar_vepeval_task import VepevalClinvarTask
 from gfmbench_api.tasks.concrete.clinvar_indel_task import IndelClinvarTask
 from gfmbench_api.tasks.concrete.loleve_causal_eqtl_task import LoleveCausalEqtlTask
+from gfmbench_api.tasks.concrete.fantom5_tss_strand_task import Fantom5TSSStrandTask
+from gfmbench_api.tasks.concrete.g4seq_strand_task import G4SeqStrandMatchedTask, G4SeqStrandTask
 
 TASK_REGISTRY: dict[str, type] = {
     "vepeval_clinvar":                    VepevalClinvarTask,
@@ -93,6 +95,9 @@ TASK_REGISTRY: dict[str, type] = {
     "var_bench_common_vs_rare":           VariantBenchmarksCommonVsRareTask,
     "var_bench_meqtl":                    VariantBenchmarksMEQTLTask,
     "var_bench_sqtl":                     VariantBenchmarksSQTLTask,
+    "fantom5_tss_strand":                 Fantom5TSSStrandTask,
+    "g4seq_strand":                       G4SeqStrandTask,
+    "g4seq_strand_matched":               G4SeqStrandMatchedTask,
 }
 
 # Model metadata only — adapter modules are imported lazily via get_model_class().

@@ -105,6 +105,11 @@ The following components support example model adapters but are not installed by
 |----------|-----|----------------------------|
 | Human hg38 (full) | https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz | LicenseRef-UCSC-Genome-Browser |
 | Human hg38 (chromosomes) | https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/ | LicenseRef-UCSC-Genome-Browser |
+| Human hg19 (full) | https://hgdownload.soe.ucsc.edu/goldenPath/hg19/bigZips/hg19.fa.gz | LicenseRef-UCSC-Genome-Browser |
+| FANTOM5 hg38 CAGE peaks (TSS strand task) | https://dbarchive.biosciencedbc.jp/data/fantom5/datafiles/reprocessed/hg38_latest/extra/CAGE_peaks/hg38_fair+new_CAGE_peaks_phase1and2.bed.gz | CC-BY-4.0 ("FANTOM5 © RIKEN licensed under CC Attribution 4.0 International") |
+| G4-seq hit files, GEO GSE63874 (G4 strand task; Chambers et al. 2015, doi:10.1038/nbt.3295) | https://ftp.ncbi.nlm.nih.gov/geo/series/GSE63nnn/GSE63874/suppl/ | LicenseRef-NCBI-Data (no licence stated on the record; NCBI: files may be freely downloaded and reproduced unless otherwise stated) |
+| lentiMPRA design tables (Agarwal et al. 2025) | https://zenodo.org/records/8219231 | CC-BY-4.0 |
+| lentiMPRA activity tables (ENCODE ENCSR022GQD, ENCSR382BVV, ENCSR244FWB) | https://www.encodeproject.org/help/citing-encode/ | LicenseRef-ENCODE-Data-Policy (free use, cite the ENCODE Consortium; not a formal licence) |
 | Mouse mm39 | https://hgdownload.soe.ucsc.edu/goldenPath/mm39/bigZips/mm39.fa.gz | LicenseRef-UCSC-Genome-Browser |
 | Zebrafish danRer11 | https://hgdownload.soe.ucsc.edu/goldenPath/danRer11/bigZips/danRer11.fa.gz | LicenseRef-UCSC-Genome-Browser |
 | Drosophila dm6 | https://hgdownload.soe.ucsc.edu/goldenPath/dm6/bigZips/dm6.fa.gz | LicenseRef-UCSC-Genome-Browser |

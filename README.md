@@ -87,7 +87,7 @@ gfmbench_api_rep/
 
 ## Supported Benchmarks & Tasks
 
-GFMBench-API supports evaluation on **22 unique tasks**, grouped as:
+GFMBench-API supports evaluation on **28 unique tasks**, grouped as:
 
 ### Supervised Classification & Variant Prediction
 
@@ -105,6 +105,14 @@ GFMBench-API supports evaluation on **22 unique tasks**, grouped as:
 | LRBCausalEqtlTask                    | Binary classification of variants causally influencing gene expression with tissue context. |
 | LRBEnhancerTask                      | Binary classification of genomic bins overlapping annotated enhancer cis-regulatory elements. |
 | LRBHistoneMarksTask                  | Multi-label classification of genomic bins across 20 histone-mark tracks. |
+| Fantom5TSSStrandTask                 | Binary plus/minus strand classification of 511 bp reference-oriented windows centred on unidirectional FANTOM5 CAGE TSSs (hg38). |
+| G4SeqStrandTask / G4SeqStrandMatchedTask | Two binary labels (G4 detected on plus / minus strand, K+ G4-seq, hg19) for 511 bp windows; the matched variant tests against GC/dinucleotide-matched negatives. |
+
+### Supervised Regression
+
+| Task Class                       | Description                             |
+| --------------------------------- | --------------------------------------- |
+| LentiMPRAHepG2Task / LentiMPRAK562Task / LentiMPRAWTC11Task | Regression of lentiMPRA reporter activity (mean log2 RNA/DNA) from a 200 bp insert, one task per cell type; both insert orientations are separate, grouped examples. Not in the `run_benchmark.py` registry: the example fine-tuner supports classification only. |
 
 ### Zero-Shot Variant Effect Prediction
 

@@ -56,4 +56,9 @@ ClinVar / other zero-shot:
 - songlab_clinvar_task: SonglabClinvarTask
 - brca1_task: BRCA1Task
 - loleve_causal_eqtl_task: LoleveCausalEqtlTask
+
+Human-DNA tasks (coordinate manifests + reference genome, or insert sequences):
+- fantom5_tss_strand_task: Fantom5TSSStrandTask (plus vs minus strand of CAGE TSSs)
+- g4seq_strand_task: G4SeqStrandTask, G4SeqStrandMatchedTask (two strand-resolved G4-seq labels)
+- lentimpra_activity_task: LentiMPRAHepG2Task, LentiMPRAK562Task, LentiMPRAWTC11Task (reporter activity)
 """
