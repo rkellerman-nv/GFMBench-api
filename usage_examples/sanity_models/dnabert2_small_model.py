@@ -21,8 +21,10 @@ extras) to be importable; it supplies the model architecture (``DNABERT2SmallFor
 and both tokenizer loaders behind a shared no-special-token encoding contract.
 """
 
+import atexit
 import hashlib
 import json
+import os
 from collections import OrderedDict
 from pathlib import Path
 from typing import List, Literal, Optional, Sequence, Tuple
@@ -69,6 +71,65 @@ _DEFAULT_TOKENIZER_ARTIFACT_RELATIVE_TO_REPO_ROOT = {
 }
 
 
+class _EmbeddingStore:
+    """Disk-backed sequence -> pooled-embedding table shared by the seeds of one probe.
+
+    A linear probe's backbone is frozen, so a sequence's embedding does not depend on the seed;
+    tokenizing in Python is ~95% of a probe step, so the first process computes and saves the
+    table and later seeds read it. Opt-in: ``GFM_EMBED_STORE=<file.npz>``; used only under
+    ``torch.no_grad()``. The file is written atomically at exit, and only when new rows were added.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.index: dict = {}
+        self.matrix: Optional[np.ndarray] = None  # [capacity, hidden]; rows [0, count) are valid
+        self.count = 0
+        self.dirty = False
+        if os.path.exists(path):
+            with np.load(path) as data:
+                keys, values = data["keys"], data["values"]
+            self.index = {key.tobytes(): i for i, key in enumerate(keys)}
+            self.matrix, self.count = values, len(values)
+        atexit.register(self.save)
+
+    @staticmethod
+    def key(sequence: str) -> bytes:
+        return hashlib.blake2b(sequence.encode(), digest_size=16).digest()
+
+    def get(self, key: bytes):
+        i = self.index.get(key)
+        return None if i is None else self.matrix[i]
+
+    def add(self, keys: List[bytes], values: np.ndarray) -> None:
+        fresh = [j for j, k in enumerate(keys) if k not in self.index]
+        fresh = list({keys[j]: j for j in fresh}.values())  # first-or-last duplicate: same embedding
+        if not fresh:
+            return
+        need = self.count + len(fresh)
+        if self.matrix is None or need > len(self.matrix):
+            grown = np.empty((max(need, 2 * self.count, 4096), values.shape[1]), dtype=np.float32)
+            if self.count:
+                grown[: self.count] = self.matrix[: self.count]
+            self.matrix = grown
+        self.matrix[self.count:need] = values[fresh]
+        for offset, j in enumerate(fresh):
+            self.index[keys[j]] = self.count + offset
+        self.count = need
+        self.dirty = True
+
+    def save(self) -> None:
+        if not self.dirty:
+            return
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        ordered = sorted(self.index, key=self.index.get)
+        keys = np.frombuffer(b"".join(ordered), dtype=np.uint8).reshape(len(ordered), 16)
+        tmp = f"{self.path}.tmp{os.getpid()}.npz"
+        np.savez(tmp, keys=keys, values=self.matrix[: self.count])
+        os.replace(tmp, self.path)
+        self.dirty = False
+
+
 class DNABERT2SmallModel(nn.Module):
     """ham-dna-tokenizer's ~8M-parameter DNABERT2-style MLM encoder for GFMBench.
 
@@ -111,6 +172,9 @@ class DNABERT2SmallModel(nn.Module):
         self.encode = None
         self._encode_cache: "OrderedDict[str, tuple]" = OrderedDict()
         self._encode_cache_chars = 0
+        self._embedding_store: Optional[_EmbeddingStore] = (
+            _EmbeddingStore(os.environ["GFM_EMBED_STORE"]) if os.environ.get("GFM_EMBED_STORE") else None
+        )
         self._nucleotide_token_ids: Optional[dict] = None
         self.config = DNABERT2SmallConfig(max_position_embeddings=max_length)
         self.max_length = max_length
@@ -293,6 +357,23 @@ class DNABERT2SmallModel(nn.Module):
         return self._mean_pool_content(hidden_states, input_ids)
 
     def _sequence_to_representative(self, sequences):
+        store = self._embedding_store
+        if store is None or torch.is_grad_enabled():
+            return self._compute_representative(sequences)
+        keys = [store.key(sequence) for sequence in sequences]
+        found = [store.get(key) for key in keys]
+        missing = [i for i, row in enumerate(found) if row is None]
+        if missing:
+            fresh = self._compute_representative([sequences[i] for i in missing])
+            fresh_np = fresh.detach().float().cpu().numpy()
+            store.add([keys[i] for i in missing], fresh_np)
+            if len(missing) == len(sequences):
+                return fresh  # nothing was cached: identical to the uncached path
+            for row, i in enumerate(missing):
+                found[i] = fresh_np[row]
+        return torch.from_numpy(np.stack(found)).to(self.device)
+
+    def _compute_representative(self, sequences):
         encoded = self.tokenize(sequences)
         outputs = self.model(**encoded)
         return self._pool(outputs.last_hidden_state, encoded["input_ids"])
